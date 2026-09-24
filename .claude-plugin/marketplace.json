@@ -1,0 +1,17 @@
+{
+  "name": "forgebench",
+  "owner": {
+    "name": "forgebench",
+    "url": "https://forgebench.ai"
+  },
+  "description": "The forgebench Claude Code plugin: the hosted forgebench MCP server, the onboarding skill and the local repository scanner.",
+  "plugins": [
+    {
+      "name": "forgebench",
+      "source": "./",
+      "description": "Onboard a repository's AI agents and MCP servers to forgebench through the hosted forgebench MCP server, with workspace default budgets and browser-only credential reveal.",
+      "category": "security",
+      "tags": ["mcp", "agents", "governance", "budgets"]
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "forgebench",
+  "displayName": "forgebench",
+  "version": "0.1.0",
+  "description": "Onboard a repository's AI agents and MCP servers to forgebench through the hosted forgebench MCP server: scan locally, review the server-side diff, then plan and apply with workspace default budgets. Agent keys are only ever revealed in the browser.",
+  "author": {
+    "name": "forgebench",
+    "url": "https://forgebench.ai"
+  },
+  "homepage": "https://forgebench.ai",
+  "repository": "https://github.com/seedlinglabs/forgebench-plugin",
+  "keywords": ["forgebench", "mcp", "agents", "governance", "budgets", "onboarding"]
+}

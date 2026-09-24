@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "papers": {
+      "command": "python3",
+      "args": ["servers/papers_server.py"],
+      "env": {"PAPERS_API_KEY": "FIXTURE_ENV_VALUE_must_never_upload"}
+    },
+    "tracker": {
+      "url": "https://tracker.example.test/mcp?token=FIXTURE_QUERY_VALUE_must_never_upload",
+      "headers": {"Authorization": "Bearer FIXTURE_HEADER_VALUE_must_never_upload"}
+    }
+  }
+}
