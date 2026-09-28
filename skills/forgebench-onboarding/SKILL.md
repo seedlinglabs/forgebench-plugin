@@ -53,7 +53,7 @@ the user what the server says, and relay their choices.
 If no `forgebench_*` tools are available, the server needs a sign-in: ask the
 user to run `/mcp`, pick the forgebench server and choose Authenticate. The
 browser opens: sign in, pick the workspace, approve access. The endpoint
-defaults to `https://api.dev.forgebench.ai/mcp`; set `FORGEBENCH_MCP_URL`
+defaults to `https://api.forgebench.ai/mcp`; set `FORGEBENCH_MCP_URL`
 before starting Claude Code to use another one (for example
 `http://localhost:8000/mcp` for the local stack).
 
