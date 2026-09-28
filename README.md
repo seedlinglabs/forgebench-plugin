@@ -33,7 +33,7 @@ give me a key for Researcher
 
 ## Configuration
 
-The plugin connects to `https://api.dev.forgebench.ai/mcp`. To use another deployment, set `FORGEBENCH_MCP_URL` before starting Claude Code.
+The plugin connects to `https://api.forgebench.ai/mcp`. To use another deployment, set `FORGEBENCH_MCP_URL` before starting Claude Code.
 
 ## Uninstall
 
