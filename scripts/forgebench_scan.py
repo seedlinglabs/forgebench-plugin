@@ -3,7 +3,7 @@
 
 Finds the MCP servers and AI agents a repository declares and uploads a
 minimal ``forgebench.scan/v1`` payload straight to the forgebench control
-plane under a single-use ticket from ``forgebench_begin_scan``. The model
+plane under a single-use ticket from ``forgebench_onboarding (action begin_scan)``. The model
 that ran this command only ever sees the counts and the sha256 printed at
 the end — the repository's contents never travel through the conversation.
 
@@ -20,7 +20,8 @@ What is read (all passive: files are parsed, never executed):
   TypeScript/JavaScript sources, for agent and MCP-client declarations of the
   frameworks the vendored agent-harness-explorer scanners know (CrewAI,
   LangGraph, OpenAI Agents SDK, AutoGen, Google ADK, Mastra, Vercel AI SDK,
-  ...). ``tests/``, ``test/``, ``examples/``, ``fixtures/``, ``docs/`` and
+  ...); Java sources (stdlib lexer) for agents built on the Forgebench Java
+  SDK, Spring AI, LangChain4j and Google ADK for Java. ``tests/``, ``test/``, ``examples/``, ``fixtures/``, ``docs/`` and
   coding-agent skill bundles (``.claude/skills``, ``.agents/skills``) are
   skipped by default — they declare agents that do not run in production;
   ``--include DIR`` re-includes one.
@@ -85,9 +86,11 @@ VENDORED_FILES = (
     "inspect_mcp_configs.py",
     "inspect_mcp_source.py",
     "inspect_ts_mcp_source.py",
+    "inspect_java_mcp_source.py",
 )
 sys.path.insert(0, str(VENDOR_DIR))
 
+import inspect_java_mcp_source as java_scan  # noqa: E402
 import inspect_mcp_configs as config_scan  # noqa: E402
 import inspect_mcp_source as py_scan  # noqa: E402
 import inspect_ts_mcp_source as ts_scan  # noqa: E402
@@ -426,6 +429,7 @@ def discover(root: Path, args: argparse.Namespace) -> Findings:
     findings = Findings()
     excludes = (set(py_scan._DEFAULT_EXCLUDE_DIRS) - set(args.include)) | set(args.exclude)
     ts_excludes = (set(ts_scan._DEFAULT_EXCLUDE_DIRS) - set(args.include)) | set(args.exclude)
+    java_excludes = (set(java_scan._DEFAULT_EXCLUDE_DIRS) - set(args.include)) | set(args.exclude)
 
     candidates: list[tuple[common.ServerConfig, str]] = []
     config_servers, config_warnings = config_scan.discover(root, include_user_scope=args.include_user_configs)
@@ -443,6 +447,7 @@ def discover(root: Path, args: argparse.Namespace) -> Findings:
                 f"{len(ts_files)} TypeScript/JavaScript file(s) were NOT scanned: install tree-sitter and "
                 "tree-sitter-typescript (pip install tree-sitter tree-sitter-typescript) to include them."
             )
+    results.append(("java-source", _source_scan(java_scan, root, java_excludes, args.max_files, findings)))
 
     for _, (servers, unresolved, agents, links, base_tools, agent_unresolved) in results:
         candidates.extend((s, s.source) for s in servers)
@@ -564,13 +569,14 @@ def build_payload(root: Path, args: argparse.Namespace, findings: Findings, tool
             entry["url_host"] = host
         servers.append(entry)
 
-    agents = []
+    agents: dict[tuple[str, str, str], dict[str, Any]] = {}
     for a in findings.agents:
         name = _clip(a["declared_name"])
         if name is None or not _FRAMEWORK.match(str(a["framework"])):
             findings.dropped += 1
             continue
-        agents.append({"framework": a["framework"], "declared_name": name, "path": _rel(prefix, a["file"]), "line": a["line"]})
+        row = {"framework": a["framework"], "declared_name": name, "path": _rel(prefix, a["file"]), "line": a["line"]}
+        agents.setdefault((row["framework"], name, row["path"]), row)
 
     frameworks = findings.agent_frameworks
 
@@ -586,8 +592,17 @@ def build_payload(root: Path, args: argparse.Namespace, findings: Findings, tool
             out["framework"] = fw
         return out
 
-    links = [x for x in (_link(r, "server") for r in findings.agent_links) if x]
-    base = [x for x in (_link(r, "tool") for r in findings.base_tools) if x]
+    # The control plane's own canonical order (app.scans.payload): with
+    # several source engines the rows would otherwise arrive grouped by
+    # language, and the stored payload would differ from the uploaded one.
+    links = sorted(
+        (x for x in (_link(r, "server") for r in findings.agent_links) if x),
+        key=lambda r: (r["agent_path"], r["agent"], r["server"], r.get("framework") or ""),
+    )
+    base = sorted(
+        (x for x in (_link(r, "tool") for r in findings.base_tools) if x),
+        key=lambda r: (r["agent_path"], r["agent"], r["tool"], r.get("framework") or ""),
+    )
     unresolved = []
     for u in findings.unresolved:
         entry = {k: v for k, v in u.items() if v not in (None, "", [])}
@@ -612,7 +627,7 @@ def build_payload(root: Path, args: argparse.Namespace, findings: Findings, tool
         "scanner": {"version": SCANNER_VERSION, "sha256": scanner_sha256()},
         "repo": repo,
         "mcp_servers": servers,
-        "agents": agents,
+        "agents": sorted(agents.values(), key=lambda a: (a["path"], a["declared_name"], a["framework"])),
         "agent_mcp_servers": links,
         "agent_base_tools": base,
         "unresolved": unresolved[:1000],
@@ -640,7 +655,7 @@ def canonical_bytes(payload: dict[str, Any]) -> bytes:
 def check_upload_target(url: str, ticket: str, allow_insecure: bool) -> Optional[str]:
     """An error message, or None if the upload may proceed."""
     if not ticket.startswith(TICKET_PREFIX):
-        return "the ticket must be the fbscan_... value returned by forgebench_begin_scan"
+        return "the ticket must be the fbscan_... value returned by forgebench_onboarding (action begin_scan)"
     try:
         parts = urllib.parse.urlsplit(url)
     except ValueError:
@@ -648,7 +663,7 @@ def check_upload_target(url: str, ticket: str, allow_insecure: bool) -> Optional
     if parts.scheme not in ("https", "http") or not parts.hostname:
         return "the upload URL must be an http(s) URL"
     if not _UPLOAD_PATH.search(parts.path) or parts.query or parts.fragment or parts.username:
-        return "the upload URL must be exactly the upload_url returned by forgebench_begin_scan"
+        return "the upload URL must be exactly the upload_url returned by forgebench_onboarding (action begin_scan)"
     if parts.scheme == "http" and parts.hostname not in _LOOPBACK_HOSTS and not allow_insecure:
         return "refusing to send the ticket over plain http to a non-local host (use https, or --allow-insecure-http)"
     return None
@@ -721,9 +736,9 @@ def build_parser() -> argparse.ArgumentParser:
         description="Scan a repository for AI agents and MCP servers and upload the findings to forgebench.",
     )
     p.add_argument("--root", type=Path, default=Path.cwd(), help="repository directory to scan (default: cwd)")
-    p.add_argument("--upload-url", help="the upload_url from forgebench_begin_scan")
-    p.add_argument("--ticket", help="the fbscan_ ticket from forgebench_begin_scan (or env FORGEBENCH_SCAN_TICKET)")
-    p.add_argument("--out", type=Path, help="write the payload JSON to this file (for forgebench_submit_scan_inline)")
+    p.add_argument("--upload-url", help="the upload_url from forgebench_onboarding (action begin_scan)")
+    p.add_argument("--ticket", help="the fbscan_ ticket from forgebench_onboarding (action begin_scan) (or env FORGEBENCH_SCAN_TICKET)")
+    p.add_argument("--out", type=Path, help="write the payload JSON to this file (for forgebench_onboarding (action submit_inline))")
     p.add_argument("--list-servers", action="store_true", help="list the MCP servers found (for consent) and exit")
     p.add_argument(
         "--dial",
@@ -792,12 +807,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         except (urllib.error.URLError, OSError) as exc:
             reason = getattr(exc, "reason", exc)
             print(f"upload failed: could not reach forgebench ({type(reason).__name__}). "
-                  "Re-run with --out FILE and use forgebench_submit_scan_inline instead.", file=sys.stderr)
+                  "Re-run with --out FILE and use forgebench_onboarding (action submit_inline) instead.", file=sys.stderr)
             return 1
         if status == 201:
             print(
                 f"uploaded: part {resp.get('part_id')} ({resp.get('parts_remaining')} part(s) and "
-                f"{resp.get('bytes_remaining')} bytes left on this scan). Now call forgebench_review_scan."
+                f"{resp.get('bytes_remaining')} bytes left on this scan). Now call forgebench_onboarding (action review)."
             )
             return 0
         detail = resp.get("detail") if isinstance(resp.get("detail"), dict) else {}

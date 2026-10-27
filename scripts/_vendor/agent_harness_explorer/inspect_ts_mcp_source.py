@@ -62,6 +62,7 @@ import argparse
 import contextlib
 import json
 import os
+import posixpath
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -178,6 +179,10 @@ KNOWN_AGENT_SYMBOLS: tuple[tuple[str, str, str, str | None, str], ...] = (
     # concept on the construct itself).
     ("ai", "generateText", "tools", None, "vercel-ai-sdk"),
     ("ai", "streamText", "tools", None, "vercel-ai-sdk"),
+    # LangGraph.js: `createReactAgent({ llm, tools: [...], name })` -- tools
+    # is an ARRAY here (see _record_tools_field); `name` is optional and
+    # falls back to the assigned variable.
+    ("@langchain/langgraph/prebuilt", "createReactAgent", "tools", "name", "langgraph"),
 )
 
 # `await <name>.<method>()` -- a passthrough call on an ALREADY-bound
@@ -778,10 +783,393 @@ def _language_for(path: Path) -> Any | None:
     return None
 
 
-def scan_file(path: Path, root: Path):
+# =============================================================================
+# Agent STRUCTURE (LangGraph.js) -- which discovered agents a repo wires
+# together. The TS counterpart of ``KNOWN_STRUCTURE_SYMBOLS`` /
+# ``_StructureCtx`` in inspect_mcp_source.py, emitting the SAME raw group shape
+# so the cross-file pass (``resolve_agent_groups``) is shared, not duplicated.
+# Edge kinds: ``createSupervisor`` members are "task" (delegation); StateGraph
+# ``addEdge``/``addConditionalEdges``/``addSequence`` are "sequence" (flow).
+# Only agents already discovered can appear; a name declared twice in ONE scope
+# is ambiguous and dropped. Registries are scope-stacked (one frame per
+# function, innermost-out reads) and parameters / loop / catch bindings shadow
+# a same-named outer agent as ambiguous.
+# =============================================================================
+
+# (module, exported name, handler id, framework)
+KNOWN_STRUCTURE_SYMBOLS: tuple[tuple[str, str, str, str], ...] = (
+    ("@langchain/langgraph", "StateGraph", "graph_new", "langgraph"),
+    ("@langchain/langgraph-supervisor", "createSupervisor", "supervisor", "langgraph"),
+)
+_STRUCTURE_INDEX = {(m, n): (h, fw) for m, n, h, fw in KNOWN_STRUCTURE_SYMBOLS}
+_GRAPH_CTORS = frozenset((m, n) for m, n, h, _ in KNOWN_STRUCTURE_SYMBOLS if h == "graph_new")
+_AGENT_CALL_SYMBOLS = frozenset((m, n) for m, n, *_ in KNOWN_AGENT_SYMBOLS)
+# `createHandoffTool({ agentName })`: the tool the MODEL calls is always
+# `transfer_to_<normalized agentName>` (langgraph-supervisor 1.1.3 / -swarm).
+_HANDOFF_TOOL_SYMBOLS = frozenset(
+    {("@langchain/langgraph-supervisor", "createHandoffTool"), ("@langchain/langgraph-swarm", "createHandoffTool")}
+)
+
+
+def _call_args(call_node: Any) -> list[Any]:
+    args = call_node.child_by_field_name("arguments")
+    return [c for c in args.named_children if c.type != "comment"] if args is not None else []
+
+
+def _idents(node: Any) -> set[str]:
+    return {_text(n) for n in _walk_all(node) if n.type == "identifier"}
+
+
+_FUNCTION_TYPES = ("function_declaration", "arrow_function", "function_expression", "method_definition")
+_BINDING_TYPES = ("identifier", "shorthand_property_identifier_pattern")
+
+
+def _binding_names(node: Any) -> set[str]:
+    return {_text(n) for n in _walk_all(node) if n.type in _BINDING_TYPES}
+
+
+def _param_names(fn: Any) -> set[str]:
+    """Names a function's parameters bind (default-value expressions excluded)."""
+    out: set[str] = set()
+    single = fn.child_by_field_name("parameter")  # `x => ...`
+    if single is not None:
+        out |= _binding_names(single)
+    params = fn.child_by_field_name("parameters")
+    for p in params.named_children if params is not None else []:
+        pattern = p.child_by_field_name("pattern")
+        out |= _binding_names(pattern if pattern is not None else p)
+    return out
+
+
+def _loop_bindings(body: Any) -> set[str]:
+    """for-in/of and catch bindings in this scope (nested functions excluded)."""
+    out: set[str] = set()
+    stack = [body]
+    while stack:
+        n = stack.pop()
+        if n.type in _FUNCTION_TYPES:
+            continue
+        if n.type == "for_in_statement":
+            left = n.child_by_field_name("left")
+            if left is not None:
+                out |= _binding_names(left)
+        elif n.type == "catch_clause":
+            param = n.child_by_field_name("parameter")
+            if param is not None:
+                out |= _binding_names(param)
+        stack.extend(n.children)
+    return out
+
+
+class _StructureCtx:
+    def __init__(self, rel: str, import_map: "_ImportMap", root_node: Any) -> None:
+        self.rel = rel
+        self.imports = import_map
+        self.agents: list[dict[str, str | None]] = [{}]  # var -> "file:line"; None = ambiguous
+        self.agent_names: dict[str, str | None] = {}  # declared name: literal -> loc / None
+        self.graphs: list[dict[str, dict | None]] = [{}]
+        self.graph_by_node: dict[int, dict] = {}
+        self.graph_list: list[dict] = []
+        self.groups: list[dict] = []
+        # function name -> identifiers in its body (None: declared twice); a
+        # graph node is often `async function researchNode(s) { researcher.invoke(..) }`
+        self.func_names: dict[str, set[str] | None] = {}
+        for n in _walk_all(root_node):
+            name_node = None
+            if n.type == "function_declaration":
+                name_node, body = n.child_by_field_name("name"), n
+            elif n.type == "variable_declarator":
+                body = n.child_by_field_name("value")
+                if body is not None and body.type in ("arrow_function", "function_expression"):
+                    name_node = n.child_by_field_name("name")
+            if name_node is not None:
+                key = _text(name_node)
+                self.func_names[key] = None if key in self.func_names else _idents(body) - _param_names(body)
+
+    def push(self, shadowed: set[str]) -> None:
+        self.agents.append({n: None for n in shadowed})
+        self.graphs.append({n: None for n in shadowed})
+
+    def pop(self) -> None:
+        self.agents.pop()
+        self.graphs.pop()
+
+    @staticmethod
+    def _lookup(stack: list[dict], name: str) -> tuple[bool, Any]:
+        for frame in reversed(stack):
+            if name in frame:
+                return True, frame[name]
+        return False, None
+
+    def origin(self, node: Any) -> tuple[str, str] | None:
+        func_node = node.child_by_field_name("constructor") or node.child_by_field_name("function")
+        return self.imports.resolve_call_origin(func_node) if func_node is not None else None
+
+    def name_ref(self, name: str) -> dict | None:
+        found, loc = self._lookup(self.agents, name)
+        if found:
+            return {"loc": loc} if loc else None
+        return {"var": name, "file": self.rel}
+
+    def declared_ref(self, name: str) -> dict:
+        return {"declared": name, "file": self.rel}
+
+    def agent_ref(self, node: Any) -> dict | None:
+        if node is None:
+            return None
+        if node.type in _IDENTIFIER_LIKE:
+            return self.name_ref(_text(node))
+        if node.type in ("call_expression", "new_expression") and self.origin(node) in _AGENT_CALL_SYMBOLS:
+            return {"loc": f"{self.rel}:{node.start_point[0] + 1}"}
+        return None
+
+    def agent_list(self, node: Any, scopes: list[dict]) -> list[dict]:
+        if node is not None and node.type in _IDENTIFIER_LIKE and not self._lookup(self.agents, _text(node))[0]:
+            node = _unwrap_one_alias(node, scopes)
+        if node is None or node.type != "array":
+            return []
+        return [r for r in (self.agent_ref(e) for e in node.named_children) if r]
+
+    def node_ref(self, action: Any) -> dict | None:
+        """A graph node's agent: an agent identifier/call, or a wrapper
+        function/arrow whose body mentions exactly one resolvable agent."""
+        names: set[str] | None = None
+        if action.type == "identifier" and not self._lookup(self.agents, _text(action))[0]:
+            names = self.func_names.get(_text(action))
+        elif action.type in ("arrow_function", "function_expression"):
+            names = _idents(action) - _param_names(action)
+        if names:
+            refs = [r for r in (self.name_ref(n) for n in sorted(names)) if r]
+            return {"anyof": refs} if refs else None
+        return self.agent_ref(action)
+
+    def on_assign(self, target: str, rhs: Any) -> None:
+        cur = self.agents[-1]
+        if target in cur:
+            cur[target] = None  # declared twice in this scope: ambiguous
+        elif self._lookup(self.agents, target)[0] and not (
+            rhs.type in ("call_expression", "new_expression") and self.origin(rhs) in _AGENT_CALL_SYMBOLS
+        ):
+            cur[target] = None  # shadows an outer agent with something else
+        self.graphs[-1][target] = None  # a rebind hides any outer graph too
+
+    def on_agent(self, fields: dict, scopes: list[dict], loc: str, assigned_to: str | None) -> None:
+        if assigned_to:
+            cur = self.agents[-1]
+            cur[assigned_to] = None if assigned_to in cur else loc
+        declared, ok = _resolve(fields.get("name"), scopes)
+        if ok and isinstance(declared, str) and declared:
+            self.agent_names[declared] = None if declared in self.agent_names else loc
+
+    def graph_for(self, node: Any) -> dict:
+        graph = self.graph_by_node.get(node.id)
+        if graph is None:
+            graph = {"line": node.start_point[0] + 1, "nodes": {}, "edges": []}
+            self.graph_by_node[node.id] = graph
+            self.graph_list.append(graph)
+        return graph
+
+    def graph_of(self, node: Any) -> dict | None:
+        if node.type == "identifier":
+            return self._lookup(self.graphs, _text(node))[1]
+        if node.type in ("call_expression", "new_expression"):
+            if node.id in self.graph_by_node:
+                return self.graph_by_node[node.id]
+            if self.origin(node) in _GRAPH_CTORS:
+                return self.graph_for(node)
+            func_node = node.child_by_field_name("function")
+            if func_node is not None and func_node.type == "member_expression":
+                prop = func_node.child_by_field_name("property")
+                if prop is not None and _text(prop) in _GRAPH_METHODS:
+                    return self.graph_of(func_node.child_by_field_name("object"))
+        return None
+
+    def method_call(self, node: Any, scopes: list[dict], assigned_to: str | None) -> None:
+        if node.type != "call_expression":
+            return
+        func_node = node.child_by_field_name("function")
+        if func_node is None or func_node.type != "member_expression":
+            return
+        prop = func_node.child_by_field_name("property")
+        method = _GRAPH_METHODS.get(_text(prop)) if prop is not None else None
+        graph = self.graph_of(func_node.child_by_field_name("object")) if method else None
+        if graph is None:
+            return
+        method(self, graph, _call_args(node), scopes)
+        if assigned_to:  # `const g = new StateGraph(S).addNode(...)` chains
+            self.graphs[-1][assigned_to] = graph
+
+    def add_group(self, kind: str, call: Any, *, hub: dict | None = None, spokes: list[dict] | None = None,
+                  members: list[dict] | None = None, edges: list[dict] | None = None) -> None:
+        self.groups.append(
+            {
+                "kind": kind, "framework": "langgraph", "file": self.rel, "line": call["line"], "name": None,
+                "hub": hub, "spokes": spokes or [], "members": members or [], "edges": edges or [],
+                "report_unresolved": kind != "graph",
+            }
+        )
+
+    def finish(self) -> list[dict]:
+        for graph in self.graph_list:
+            nodes = graph["nodes"]
+            edges = [
+                {"from": nodes[s], "to": nodes[d], "kind": "task" if via == "ends" else "sequence", "via": via}
+                for s, d, via in graph["edges"]
+                if nodes.get(s) and nodes.get(d)
+            ]
+            self.add_group("graph", graph, members=[r for r in nodes.values() if r], edges=edges)
+        return self.groups
+
+
+def _node_names(node: Any, scopes: list[dict]) -> list[str]:
+    if node is None:
+        return []
+    node = _unwrap_one_alias(node, scopes)
+    if node.type == "array":
+        return [v for e in node.named_children for v in _node_names(e, scopes)]
+    value, ok = _resolve(node, scopes)
+    return [value] if ok and isinstance(value, str) else []
+
+
+def _graph_add_node(ctx: _StructureCtx, graph: dict, args: list[Any], scopes: list[dict]) -> None:
+    if len(args) < 2:
+        return
+    names = _node_names(args[0], scopes)
+    if names:
+        graph["nodes"][names[0]] = ctx.node_ref(args[1])
+        # `{ ends: [...] }` declares Command/handoff routing: delegation (task)
+        opts = _object_fields(_unwrap_one_alias(args[2], scopes)) if len(args) > 2 else None
+        if opts and "ends" in opts:
+            for dest in _node_names(opts["ends"], scopes):
+                graph["edges"].append((names[0], dest, "ends"))
+
+
+def _graph_add_edge(ctx: _StructureCtx, graph: dict, args: list[Any], scopes: list[dict]) -> None:
+    if len(args) < 2:
+        return
+    for s in _node_names(args[0], scopes):
+        for d in _node_names(args[1], scopes):
+            graph["edges"].append((s, d, "addEdge"))
+
+
+def _graph_add_conditional_edges(ctx: _StructureCtx, graph: dict, args: list[Any], scopes: list[dict]) -> None:
+    if len(args) < 3:
+        return
+    path_map = _unwrap_one_alias(args[2], scopes)
+    fields = _object_fields(path_map)
+    # a value like `END` is unresolvable on its own; resolve each target
+    # separately so it does not poison the others
+    targets = (
+        [t for v in fields.values() for t in _node_names(v, scopes)] if fields is not None else _node_names(path_map, scopes)
+    )
+    for s in _node_names(args[0], scopes):
+        for d in targets:
+            graph["edges"].append((s, d, "addConditionalEdges"))
+
+
+def _graph_add_sequence(ctx: _StructureCtx, graph: dict, args: list[Any], scopes: list[dict]) -> None:
+    if not args:
+        return
+    seq = _unwrap_one_alias(args[0], scopes)
+    pairs: list[tuple[list[str], Any]] = []
+    fields = _object_fields(seq)
+    if fields is not None:
+        pairs = [([k], v) for k, v in fields.items()]
+    elif seq.type == "array":
+        for elt in seq.named_children:
+            if elt.type == "array" and len(elt.named_children) == 2:
+                pairs.append((_node_names(elt.named_children[0], scopes), elt.named_children[1]))
+    names: list[str] = []
+    for name_list, action in pairs:
+        if name_list:
+            graph["nodes"][name_list[0]] = ctx.node_ref(action)
+            names.append(name_list[0])
+    for a, b in zip(names, names[1:]):
+        graph["edges"].append((a, b, "addSequence"))
+
+
+_GRAPH_METHODS: dict[str, Callable[..., None]] = {
+    "addNode": _graph_add_node,
+    "addEdge": _graph_add_edge,
+    "addConditionalEdges": _graph_add_conditional_edges,
+    "addSequence": _graph_add_sequence,
+}
+
+
+def _structure_graph_new(ctx: _StructureCtx, node: Any, scopes: list[dict], assigned_to: str | None) -> None:
+    graph = ctx.graph_for(node)
+    if assigned_to:
+        ctx.graphs[-1][assigned_to] = graph
+
+
+def _structure_supervisor(ctx: _StructureCtx, node: Any, scopes: list[dict], assigned_to: str | None) -> None:
+    """``createSupervisor({ agents: [a, b], supervisorName? })``: supervisor ->
+    each member (task). The supervisor is built inside the library, so it is
+    only a member when a discovered agent is declared with that name; without an
+    explicit ``supervisorName`` (the library default is not inferred) the group
+    keeps its members with no edges."""
+    fields = _object_fields(_call_arguments_object(node, scopes)) or {}
+    members = ctx.agent_list(fields.get("agents"), scopes)
+    hub = None
+    fmt, extra = "lc_transfer", {}
+    if "handoffToolPrefix" in fields:  # not an option of the version we know: never guess its effect
+        fmt, extra = "unknown", {"tool_why": "createSupervisor handoffToolPrefix is not understood"}
+    if "supervisorName" in fields:
+        value, ok = _resolve(fields["supervisorName"], scopes)
+        if ok and isinstance(value, str) and value:
+            hub = ctx.declared_ref(value)
+    ctx.add_group(
+        "supervisor", {"line": node.start_point[0] + 1}, hub=hub, members=members,
+        spokes=[{"ref": r, "via": "createSupervisor", "tool_fmt": fmt, **extra} for r in members],
+    )
+
+
+STRUCTURE_HANDLERS: dict[str, Callable[..., None]] = {
+    "graph_new": _structure_graph_new,
+    "supervisor": _structure_supervisor,
+}
+
+
+def new_structure() -> dict:
+    return _py_source.new_structure()
+
+
+def make_ts_locator(files: Any) -> Callable[[str, str], str | None]:
+    """(importing file, relative import specifier) -> scanned file path.
+    Bare package specifiers and tsconfig path aliases are never followed."""
+    known = set(files)
+
+    def locate(from_file: str, spec: str) -> str | None:
+        if not spec.startswith("."):
+            return None
+        path = posixpath.normpath(posixpath.join(posixpath.dirname(from_file), spec))
+        stems = [path]
+        for ext in (".js", ".jsx", ".mjs", ".ts", ".tsx"):
+            if path.endswith(ext):
+                stems.append(path[: -len(ext)])
+        for stem in stems:
+            for suffix in ("", ".ts", ".tsx", ".js", ".jsx", "/index.ts", "/index.tsx", "/index.js"):
+                if stem + suffix in known and (stem + suffix) != from_file:
+                    return stem + suffix
+        return None
+
+    return locate
+
+
+def resolve_agent_groups(
+    raw_groups: list[dict], agents: list[AgentRecord], file_info: dict, warnings: list[str] | None = None,
+    handoff_tools: list[dict] | None = None,
+) -> list[dict]:
+    return _py_source.resolve_agent_groups(
+        raw_groups, agents, file_info, make_ts_locator(file_info), warnings, handoff_tools
+    )
+
+
+def scan_file(path: Path, root: Path, structure: dict | None = None):
     """Returns (mcp_records, agents, agent_mcp_links_pending, agent_base_tools,
     agent_unresolved_tools, warnings) -- identical shape to
-    inspect_mcp_source.py's own ``scan_file``."""
+    inspect_mcp_source.py's own ``scan_file``. ``structure`` (``new_structure()``)
+    is an out-parameter collecting this file's raw agent-group facts."""
     warnings: list[str] = []
     empty: tuple = ([], [], [], [], [], warnings)
     language = _language_for(path)
@@ -811,6 +1199,7 @@ def scan_file(path: Path, root: Path):
     except ValueError:
         rel = path
     rel_str = str(rel).replace(os.sep, "/")
+    ctx = _StructureCtx(rel_str, import_map, tree.root_node)
 
     def _bind_tool_set(name: str, keys: list[tuple[str, int, int]]) -> None:
         if keys:
@@ -874,6 +1263,19 @@ def scan_file(path: Path, root: Path):
             return keys
         return []
 
+    def _handoff_tool_name(element: Any, scopes: list[dict]) -> str | None:
+        """The model-facing name when ``element`` (or the const it names) is a
+        ``createHandoffTool({ agentName: "x" })`` call with a literal name."""
+        if element.type in _IDENTIFIER_LIKE and _text(element) not in tool_set_bindings:
+            element = _unwrap_one_alias(element, scopes)
+        if element.type != "call_expression" or ctx.origin(element) not in _HANDOFF_TOOL_SYMBOLS:
+            return None
+        fields = _object_fields(_call_arguments_object(element, scopes)) or {}
+        value, ok = _resolve(fields.get("agentName"), scopes)
+        if ok and isinstance(value, str) and value:
+            return f"transfer_to_{_py_source.lc_normalize_agent_name(value)}"
+        return None
+
     def _record_tools_field(agent_name: str, agent_location: str, node: Any, line: int, scopes: list[dict]) -> None:
         if node is None:
             return
@@ -889,6 +1291,32 @@ def scan_file(path: Path, root: Path):
                 {"agent": agent_name, "agent_location": agent_location, "keys": tool_set_bindings[_text(node)]}
             )
             return
+        if node.type == "array":
+            # LangGraph.js: `tools: [a, b]` -- an identifier is a base tool (or
+            # an MCP tool-set binding); anything else is reported unresolved.
+            for element in node.named_children:
+                handoff = _handoff_tool_name(element, scopes)
+                if handoff is not None:
+                    problem = _py_source.handoff_name_problem(handoff)
+                    if problem:
+                        warnings.append(f"{rel_str}:{line}: handoff tool name {handoff!r} skipped: {problem}")
+                    else:
+                        agent_base_tools.append(
+                            {"agent": agent_name, "agent_location": agent_location, "tool": handoff, "handoff": True}
+                        )
+                    continue
+                if element.type in _IDENTIFIER_LIKE and _text(element) in tool_set_bindings:
+                    agent_mcp_links_pending.append(
+                        {"agent": agent_name, "agent_location": agent_location, "keys": tool_set_bindings[_text(element)]}
+                    )
+                elif element.type in _IDENTIFIER_LIKE:
+                    agent_base_tools.append({"agent": agent_name, "agent_location": agent_location, "tool": _text(element)})
+                else:
+                    agent_unresolved_tools.append(
+                        {"agent": agent_name, "agent_location": agent_location, "file": rel_str, "line": line,
+                         "reason": _unresolved_reason(element)}
+                    )
+            return
         fields = _object_fields(node)
         if fields is None:
             agent_unresolved_tools.append(
@@ -902,8 +1330,12 @@ def scan_file(path: Path, root: Path):
         if node.type in ("function_declaration", "arrow_function", "function_expression", "method_definition"):
             body = node.child_by_field_name("body")
             new_scopes = [*scopes, _resolution_env(body.named_children if body is not None else [])]
-            for child in node.children:
-                walk(child, new_scopes)
+            ctx.push(_param_names(node) | (_loop_bindings(body) if body is not None else set()))
+            try:
+                for child in node.children:
+                    walk(child, new_scopes)
+            finally:
+                ctx.pop()
             return
 
         if node.type == "lexical_declaration":
@@ -918,6 +1350,7 @@ def scan_file(path: Path, root: Path):
                     continue
                 target = _text(name_node)
                 rhs = value_node.named_children[0] if value_node.type == "await_expression" and value_node.named_children else value_node
+                ctx.on_assign(target, rhs)
 
                 if rhs.type == "call_expression":
                     func_node = rhs.child_by_field_name("function")
@@ -940,6 +1373,7 @@ def scan_file(path: Path, root: Path):
             return
 
         if node.type in ("call_expression", "new_expression"):
+            ctx.method_call(node, scopes, assigned_to)  # StateGraph builder methods
             func_node = node.child_by_field_name("constructor") or node.child_by_field_name("function")
             origin = import_map.resolve_call_origin(func_node) if func_node is not None else None
             matched_mcp = False
@@ -980,11 +1414,23 @@ def scan_file(path: Path, root: Path):
                         line = node.start_point[0] + 1
                         agents.append(AgentRecord(name=agent_name, framework=framework, file=rel_str, line=line))
                         _record_tools_field(agent_name, f"{rel_str}:{line}", fields.get(tools_field), line, scopes)
+                        ctx.on_agent(fields, scopes, f"{rel_str}:{line}", assigned_to)
                         break
+                    structure_row = _STRUCTURE_INDEX.get(origin)
+                    if structure_row is not None:
+                        STRUCTURE_HANDLERS[structure_row[0]](ctx, node, scopes, assigned_to)
         for child in node.children:
             walk(child, scopes)
 
+    ctx.agents[0].update({n: None for n in _loop_bindings(tree.root_node)})
     walk(tree.root_node, [_resolution_env(tree.root_node.named_children)])
+    if structure is not None:
+        structure["groups"].extend(ctx.finish())
+        structure["files"][rel_str] = {
+            "exports": ctx.agents[0],
+            "agent_names": ctx.agent_names,
+            "imports": {**{k: (m, "default") for k, m in import_map.default.items()}, **import_map.named},
+        }
     return records, agents, agent_mcp_links_pending, agent_base_tools, agent_unresolved_tools, warnings
 
 
@@ -1026,7 +1472,7 @@ def iter_source_files(root: Path, exclude_dirs: set[str], max_files: int) -> tup
     return files, warnings
 
 
-def discover_source(root: Path, exclude_dirs: set[str], max_files: int):
+def discover_source(root: Path, exclude_dirs: set[str], max_files: int, structure: dict | None = None):
     files, warnings = iter_source_files(root, exclude_dirs, max_files)
     all_records: list[CallSiteRecord] = []
     all_agents: list[AgentRecord] = []
@@ -1034,7 +1480,7 @@ def discover_source(root: Path, exclude_dirs: set[str], max_files: int):
     all_base_tools: list[dict] = []
     all_unresolved_tools: list[dict] = []
     for path in files:
-        records, agents, links_pending, base_tools, unresolved_tools, file_warnings = scan_file(path, root)
+        records, agents, links_pending, base_tools, unresolved_tools, file_warnings = scan_file(path, root, structure)
         all_records.extend(records)
         all_agents.extend(agents)
         all_links_pending.extend(links_pending)
@@ -1145,7 +1591,9 @@ def _redact_partial_resolution(record: CallSiteRecord) -> dict[str, Any]:
     return out
 
 
-def _discovered_source_to_dict(servers, unresolved, agents, agent_mcp_servers, agent_base_tools, agent_unresolved_tools) -> dict:
+def _discovered_source_to_dict(
+    servers, unresolved, agents, agent_mcp_servers, agent_base_tools, agent_unresolved_tools, agent_groups=None
+) -> dict:
     out = common._discovered_to_dict(servers)
     out["unresolved_call_sites"] = [
         {
@@ -1163,6 +1611,7 @@ def _discovered_source_to_dict(servers, unresolved, agents, agent_mcp_servers, a
     out["agent_mcp_servers"] = agent_mcp_servers
     out["agent_base_tools"] = agent_base_tools
     out["agent_unresolved_tools"] = agent_unresolved_tools
+    out["agent_groups"] = agent_groups or []  # additive; see KNOWN_STRUCTURE_SYMBOLS
     return out
 
 
@@ -1205,9 +1654,13 @@ def _main(argv: list[str]) -> int:
 
     root = args.root.resolve()
     exclude_dirs = (set(_DEFAULT_EXCLUDE_DIRS) - set(args.include)) | set(args.exclude)
+    structure = new_structure()
     records, agents, links_pending, base_tools, unresolved_tools, warnings = discover_source(
-        root, exclude_dirs, args.max_files
+        root, exclude_dirs, args.max_files, structure
     )
+    handoff_tools: list[dict] = []
+    agent_groups = resolve_agent_groups(structure["groups"], agents, structure["files"], warnings, handoff_tools)
+    base_tools = _py_source.merge_handoff_tools(base_tools, handoff_tools)
     servers, unresolved, dedupe_warnings, keys_to_server_name = to_servers_and_unresolved(records)
     agent_mcp_servers = resolve_agent_links(links_pending, keys_to_server_name, unresolved_tools)
     warnings = warnings + dedupe_warnings
@@ -1221,7 +1674,7 @@ def _main(argv: list[str]) -> int:
         # --discover-only the ONLY reachable non-dial mode on this path, so
         # a plain count here would make the consent listing SKILL.md
         # requires before a --dial run entirely unreachable for TS/JS.
-        listing = (servers, unresolved, agents, agent_mcp_servers, base_tools, unresolved_tools)
+        listing = (servers, unresolved, agents, agent_mcp_servers, base_tools, unresolved_tools, agent_groups)
         out_dict = _discovered_source_to_dict(*listing)
         # Same stdout contract as inspect_mcp_source.py: without --out the JSON
         # is stdout and the human listing goes to stderr.
