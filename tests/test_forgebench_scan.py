@@ -173,6 +173,32 @@ def test_payload_passes_the_control_plane_validator_unchanged(repo, home):
     assert json.dumps(normalized, sort_keys=True) == json.dumps(payload, sort_keys=True)
 
 
+def test_java_agents_are_scanned_and_pass_the_validator(repo, home):
+    module = repo / "java-worker"
+    (module / "src/main/java/w").mkdir(parents=True)
+    (module / "pom.xml").write_text("<project><artifactId>review-classifier</artifactId></project>")
+    (module / "src/main/java/w/Worker.java").write_text(
+        "import ai.forgebench.Forgebench;\n"
+        "import com.google.adk.agents.LlmAgent;\n"
+        "class Worker {\n"
+        "    Forgebench client = Forgebench.builder().build();\n"
+        '    LlmAgent triage = LlmAgent.builder().name("triage").build();\n'
+        "}\n"
+    )
+    payload, _, proc = scan_to_file(repo, home)
+    agents = {(a["framework"], a["declared_name"], a["path"], a["line"]) for a in payload["agents"]}
+    assert ("forgebench-java", "review-classifier", "java-worker/src/main/java/w/Worker.java", 4) in agents
+    assert ("google-adk", "triage", "java-worker/src/main/java/w/Worker.java", 5) in agents
+    assert "4 agent(s)" in proc.stdout and "review-classifier" not in proc.stdout
+    if (CONTROL_PLANE / "app" / "scans" / "payload.py").is_file():
+        sys.path.insert(0, str(CONTROL_PLANE))
+        try:
+            from app.scans.payload import validate_part
+        finally:
+            sys.path.remove(str(CONTROL_PLANE))
+        assert json.dumps(validate_part("scanner", payload), sort_keys=True) == json.dumps(payload, sort_keys=True)
+
+
 def test_scanning_is_deterministic(repo, home):
     a, raw_a, _ = scan_to_file(repo, home)
     b, raw_b, _ = scan_to_file(repo, home)

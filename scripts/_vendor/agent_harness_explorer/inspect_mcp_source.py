@@ -56,9 +56,9 @@ Not included, on purpose (see ``KNOWN_MCP_SYMBOLS``'s own comment and this
 module's own "don't guess" stance): any framework/shape not independently
 confirmed here, LlamaIndex's deprecated ``.from_tools()``/``ReActAgent``/
 ``OpenAIAgent`` idiom (superseded by ``FunctionAgent``, but still shows up
-in older code) and its ``AgentWorkflow(agents=[...])`` multi-agent
-construction path (never independently verified), cross-file variable
-resolution, following a function call to see what it returns, tracing through a
+in older code), MCP/tool linking through a variable imported from another
+file (agent STRUCTURE -- ``agent_groups`` -- is resolved cross-file; tool
+sets are not), following a function call to see what it returns, tracing through a
 lambda body (Strands' ``MCPClient(lambda: stdio_client(...))`` stdio
 idiom -- its own inner ``StdioServerParameters`` call is still found
 independently, just not linked back to that specific ``MCPClient`` call
@@ -97,12 +97,13 @@ import ast
 import contextlib
 import json
 import os
+import re
 import shlex
 import sys
 import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mcp_discovery_common as common  # noqa: E402
@@ -460,11 +461,11 @@ KNOWN_AGENT_SYMBOLS: tuple[tuple[str, str, tuple, tuple, str, tuple | None], ...
     # LlamaIndex: FunctionAgent(name=..., tools=[...], llm=..., ...) -- a
     # Pydantic model, so every field is a real kwarg (confirmed via
     # source); `name` defaults to "Agent" but is a real, settable field.
-    # The legacy `.from_tools()` classmethod (ReActAgent/OpenAIAgent) and
-    # the multi-agent `AgentWorkflow(agents=[...])` construction path are
-    # both deliberately NOT covered -- the former is marked deprecated in
-    # the codebase itself, the latter takes pre-built agent instances
-    # rather than a raw tool list and was never independently verified.
+    # The legacy `.from_tools()` classmethod (ReActAgent/OpenAIAgent) is
+    # deliberately NOT covered (deprecated in the codebase itself).
+    # `AgentWorkflow(agents=[...])` takes pre-built instances rather than a
+    # tool list, so it is not an agent row -- it is a STRUCTURE row
+    # (KNOWN_STRUCTURE_SYMBOLS) grouping agents already discovered here.
     ("llama_index.core.agent.workflow", "FunctionAgent", ("kwarg", "tools"), ("kwarg", "name"), "llama-index", None),
     # Agno: a dataclass (init=False, custom __init__) -- confirmed via
     # source that `tools=` and `name=` are both real fields on its kwarg
@@ -1379,6 +1380,11 @@ _MIXED_TOOLS_KWARG_BY_AGENT: dict[tuple[str, str], str] = {
 # BY_AGENT` -- a real codebase uses one style or the other, never both.
 _FALLBACK_TOOLS_KWARG_BY_AGENT: dict[tuple[str, str], str] = {
     ("semantic_kernel.agents", "ChatCompletionAgent"): "kernel",
+    # `create_react_agent(model, tools=[...])` passes tools by KEYWORD far more
+    # often than by position -- without this its tools (handoff tools included)
+    # were never read.
+    ("langgraph.prebuilt", "create_react_agent"): "tools",
+    ("langchain.agents", "create_agent"): "tools",
 }
 
 # (module, symbol) rows recognized as constructing a Kernel-like object --
@@ -1483,6 +1489,55 @@ def _spec_node(call: ast.Call, spec: tuple) -> ast.expr | None:
     return None
 
 
+_HANDOFF_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def handoff_name_problem(name: str) -> str | None:
+    """Why a derived handoff tool name must NOT be registered in the tool
+    catalog (and so granted), or None. The name comes from scanned source, so it
+    is untrusted: only a plain function-name shape is accepted, and the
+    ``mcp_`` namespace belongs to the MCP gate, never this catalog."""
+    if not _HANDOFF_NAME_RE.fullmatch(name):
+        return "is not a plain tool name ([A-Za-z0-9_-], 1-64 chars)"
+    if name.startswith("mcp_"):
+        return "uses the reserved mcp_ prefix"
+    return None
+
+
+def lc_normalize_agent_name(name: str) -> str:
+    """langgraph-supervisor / -swarm ``_normalize_agent_name``."""
+    return re.sub(r"\s+", "_", name.strip()).lower()
+
+
+def oa_function_tool_name(name: str) -> str:
+    """OpenAI Agents SDK ``transform_string_function_style``."""
+    return re.sub(r"[^a-zA-Z0-9_]", "_", re.sub(r"\s", "_", name)).lower()
+
+
+def _handoff_tool_element(call: ast.Call, scopes: list[dict]) -> tuple[str, str]:
+    """("handoff" | "handoff_explicit", name) | ("unresolved", reason); explicit
+    = the name came from a literal ``name=`` rather than the default pattern."""
+    kind, value = _handoff_tool_element_raw(call, scopes)
+    explicit = kind == "handoff" and "name" in _call_kwargs(call)
+    return ("handoff_explicit" if explicit else kind), value
+
+
+def _handoff_tool_element_raw(call: ast.Call, scopes: list[dict]) -> tuple[str, str]:
+    """``create_handoff_tool(agent_name="x"[, name="n"])`` -> ("handoff", the tool
+    name the MODEL emits): ``name`` when given, else ``transfer_to_<normalized
+    agent_name>`` (langgraph-supervisor 0.0.31 / langgraph-swarm 0.1.0)."""
+    kwargs = _call_kwargs(call)
+    if "name" in kwargs:
+        value, ok = _resolve(kwargs["name"], scopes)
+        if ok and isinstance(value, str) and value:
+            return ("handoff", value)
+        return ("unresolved", "create_handoff_tool name= is not a string literal")
+    value, ok = _resolve(kwargs.get("agent_name") or (call.args[0] if call.args else None), scopes)
+    if ok and isinstance(value, str) and value:
+        return ("handoff", f"transfer_to_{lc_normalize_agent_name(value)}")
+    return ("unresolved", "create_handoff_tool agent_name= is not a string literal")
+
+
 def _resolve_one_tool_element(
     node: ast.expr,
     lookup_tool_set: Callable[[str], list[tuple[str, int, int, int]] | None],
@@ -1512,6 +1567,9 @@ def _resolve_one_tool_element(
         keys = lookup_tool_set(node.id)
         if keys is not None:
             return ("mcp_keys", keys)
+        bound = _unwrap_one_alias(node, scopes)
+        if isinstance(bound, ast.Call) and import_map.resolve_call_symbol(bound) in _HANDOFF_TOOL_SYMBOLS:
+            return _handoff_tool_element(bound, scopes)
         return ("base", node.id)
     if isinstance(node, ast.Attribute):
         # `kernel=self.kernel` (Semantic Kernel's decoupled style) --
@@ -1538,6 +1596,8 @@ def _resolve_one_tool_element(
         # already-resolved name as if it were something ambiguous.
         return ("base", node.value)
     if isinstance(node, ast.Call):
+        if import_map.resolve_call_symbol(node) in _HANDOFF_TOOL_SYMBOLS:
+            return _handoff_tool_element(node, scopes)
         predicted = _predict_mcp_key(node, import_map, scopes, rel_str)
         if predicted is not None:
             return ("mcp_keys", [predicted])
@@ -1601,8 +1661,786 @@ def _resolve_one_tool_element(
 # =============================================================================
 
 
+# =============================================================================
+# Agent STRUCTURE -- which discovered agents a repo wires TOGETHER (forgebench
+# addition). A THIRD catalog beside KNOWN_MCP_SYMBOLS / KNOWN_AGENT_SYMBOLS,
+# same discipline: a data table of import-resolved symbols, one small handler
+# per shape. Output is the additive top-level ``agent_groups`` key; nothing
+# the agent/MCP scan emits changes.
+#
+# Edge kinds (user decision): a DELEGATION relationship -- supervisor members,
+# handoffs, agent-as-tool, a CrewAI hierarchical manager, LlamaIndex
+# ``can_handoff_to``, smolagents ``managed_agents`` -- is kind "task"; graph
+# FLOW -- StateGraph ``add_edge``/``add_conditional_edges``/``add_sequence``,
+# CrewAI sequential task order -- is kind "sequence".
+#
+# Only agents the scanner already discovered can appear: a node/target that
+# does not resolve to a discovered agent is dropped (a name assigned twice in
+# one scope is "ambiguous" and likewise dropped -- never a guess).
+# =============================================================================
+
+# (module, symbol, handler id, framework)
+KNOWN_STRUCTURE_SYMBOLS: tuple[tuple[str, str, str, str], ...] = (
+    ("langgraph.graph", "StateGraph", "graph_new", "langgraph"),
+    ("langgraph.graph.state", "StateGraph", "graph_new", "langgraph"),
+    ("langgraph_supervisor", "create_supervisor", "supervisor", "langgraph"),
+    ("langgraph_supervisor.supervisor", "create_supervisor", "supervisor", "langgraph"),
+    ("crewai", "Crew", "crew", "crewai"),
+    ("crewai", "Task", "crew_task", "crewai"),
+    ("llama_index.core.agent.workflow", "AgentWorkflow", "agent_workflow", "llama-index"),
+)
+
+# Per agent constructor: (kwarg, what its value holds, edge `via`).
+# "agents" = agent variables / inline agent calls (``handoff(x)`` unwrapped);
+# "names" = string DECLARED names of other agents.
+KNOWN_DELEGATION_KWARGS: dict[tuple[str, str], tuple[tuple[str, str, str], ...]] = {
+    ("agents", "Agent"): (("handoffs", "agents", "handoffs"),),
+    ("smolagents", "CodeAgent"): (("managed_agents", "agents", "managed_agents"),),
+    ("smolagents", "ToolCallingAgent"): (("managed_agents", "agents", "managed_agents"),),
+    ("llama_index.core.agent.workflow", "FunctionAgent"): (("can_handoff_to", "names", "can_handoff_to"),),
+}
+
+# ``create_handoff_tool(agent_name="x")`` inside an agent's tools; and the
+# OpenAI Agents SDK ``handoff(agent)`` wrapper (unwrapped to its agent).
+_HANDOFF_TOOL_SYMBOLS = frozenset(
+    {
+        ("langgraph_supervisor", "create_handoff_tool"),
+        ("langgraph_supervisor.handoff", "create_handoff_tool"),
+        ("langgraph_swarm", "create_handoff_tool"),
+    }
+)
+_HANDOFF_WRAPPER_SYMBOLS = frozenset({("agents", "handoff")})
+
+_AGENT_CALL_SYMBOLS = frozenset((m, s) for m, s, *_ in KNOWN_AGENT_SYMBOLS)
+_STRUCTURE_INDEX = {(m, s): (h, fw) for m, s, h, fw in KNOWN_STRUCTURE_SYMBOLS}
+_GRAPH_CTORS = frozenset((m, s) for m, s, h, _ in KNOWN_STRUCTURE_SYMBOLS if h == "graph_new")
+
+
+#: Edge ``via`` -> how the delegating agent's MODEL names the tool it calls to
+#: delegate (see ``resolve_agent_groups``' handoff pass): "oa_transfer" =
+#: OpenAI Agents SDK ``transfer_to_<agent.name>`` (non-alnum -> "_", lowercased),
+#: "oa_as_tool" = ``Agent.as_tool`` (its tool_name, else the transformed agent
+#: name), "raw" = the managed agent's own name (smolagents ToolCallingAgent),
+#: "fixed:handoff" = LlamaIndex's single ``handoff`` tool, "lc_transfer" =
+#: langgraph-supervisor ``transfer_to_<normalized member name>`` on the
+#: supervisor agent.
+_TOOL_FMT_BY_VIA = {
+    "handoffs": "oa_transfer",
+    "as_tool": "oa_as_tool",
+    "can_handoff_to": "fixed:handoff",
+    "createSupervisor": "lc_transfer",
+    "create_supervisor": "lc_transfer",
+}
+
+
+def _spoke(ref: dict, via: str, fmt: str | None, **extra: Any) -> dict:
+    return {"ref": ref, "via": via, **({"tool_fmt": fmt} if fmt else {}), **extra}
+
+
+def _non_assign_bindings(body: list[ast.stmt]) -> set[str]:
+    """Names bound by for/with/except/comprehension/walrus targets in this
+    scope (nested defs/lambdas are their own scopes). Plain assignments are
+    tracked by ``on_assign``/``on_agent`` instead."""
+    out: set[str] = set()
+    stack: list[ast.AST] = list(body)
+    while stack:
+        n = stack.pop()
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            continue
+        targets: list[ast.AST] = []
+        if isinstance(n, (ast.For, ast.AsyncFor, ast.comprehension)):
+            targets.append(n.target)
+        elif isinstance(n, ast.withitem) and n.optional_vars is not None:
+            targets.append(n.optional_vars)
+        elif isinstance(n, ast.NamedExpr):
+            targets.append(n.target)
+        elif isinstance(n, ast.ExceptHandler) and n.name:
+            out.add(n.name)
+        for t in targets:
+            out.update(x.id for x in ast.walk(t) if isinstance(x, ast.Name))
+        stack.extend(ast.iter_child_nodes(n))
+    return out
+
+
+def _expr_names(node: ast.AST, exclude: set[str]) -> set[str]:
+    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)} - exclude
+
+
+class _StructureCtx:
+    """Per-file state for the structure handlers. Registries are scope-stacked
+    in lockstep with ``scan_file``'s tool_set_bindings_stack (one frame per
+    module/function body, reads innermost-out, writes innermost only)."""
+
+    def __init__(self, rel: str, import_map: "_ImportMap", tree: ast.Module) -> None:
+        self.rel = rel
+        self.imports = import_map
+        # name -> "file:line" of the agent call, or None when AMBIGUOUS (the
+        # name was assigned more than once in that scope)
+        self.agents: list[dict[str, str | None]] = [{}]
+        self.delegates: list[dict[str, list]] = [{}]  # var -> [(ref, via)]
+        self.tasks: list[dict[str, dict | None]] = [{}]  # CrewAI Task var -> agent ref
+        self.graphs: list[dict[str, dict]] = [{}]
+        self._stacks = (self.agents, self.delegates, self.tasks, self.graphs)
+        self.agent_names: dict[str, str | None] = {}  # declared name= literal -> loc / None
+        self.graph_by_call: dict[int, dict] = {}
+        self.graph_list: list[dict] = []
+        self.groups: list[dict] = []
+        # function name -> Load-names in its body (None: defined twice).
+        # A graph node is often `def research_node(state): researcher.invoke(..)`.
+        self.func_names: dict[str, set[str] | None] = {}
+        for n in ast.walk(tree):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                body_names = _expr_names(n, set(_param_names(n.args)))
+                self.func_names[n.name] = None if n.name in self.func_names else body_names
+
+    def push(self, shadowed: Iterable[str] = ()) -> None:
+        """New scope frame. ``shadowed`` names (parameters, loop/with/except/
+        comprehension targets) are bound as AMBIGUOUS in every registry so a
+        same-named module-level agent/graph/delegate is never mislinked."""
+        for s in self._stacks:
+            s.append({})
+        self.bind_shadowed(shadowed)
+
+    def bind_shadowed(self, names: Iterable[str]) -> None:
+        for n in names:
+            self.agents[-1][n] = None
+            self.delegates[-1][n] = []
+            self.tasks[-1][n] = None
+            self.graphs[-1][n] = None
+
+    def pop(self) -> None:
+        for s in self._stacks:
+            s.pop()
+
+    @staticmethod
+    def _lookup(stack: list[dict], name: str) -> tuple[bool, Any]:
+        for frame in reversed(stack):
+            if name in frame:
+                return True, frame[name]
+        return False, None
+
+    # ---- refs: {"loc"} exact | {"var"} / {"declared"} resolved in the
+    # cross-file pass | {"anyof": [...]} a wrapper that mentions one agent ----
+    def name_ref(self, name: str) -> dict | None:
+        found, loc = self._lookup(self.agents, name)
+        if found:
+            return {"loc": loc} if loc else None  # None loc = ambiguous: dropped
+        return {"var": name, "file": self.rel}
+
+    def declared_ref(self, name: str) -> dict:
+        return {"declared": name, "file": self.rel}
+
+    def is_agent_call(self, expr: ast.AST) -> bool:
+        return isinstance(expr, ast.Call) and self.imports.resolve_call_symbol(expr) in _AGENT_CALL_SYMBOLS
+
+    def agent_ref(self, expr: ast.AST | None) -> dict | None:
+        if isinstance(expr, ast.Name):
+            return self.name_ref(expr.id)
+        if isinstance(expr, ast.Call):
+            origin = self.imports.resolve_call_symbol(expr)
+            if origin in _AGENT_CALL_SYMBOLS:
+                return {"loc": f"{self.rel}:{expr.lineno}"}
+            if origin in _HANDOFF_WRAPPER_SYMBOLS:
+                inner = expr.args[0] if expr.args else _call_kwargs(expr).get("agent")
+                ref = self.agent_ref(inner)
+                override = _call_kwargs(expr).get("tool_name_override")
+                if ref is not None and override is not None:
+                    value, ok = _resolve(override, [])
+                    if ok and isinstance(value, str) and value:
+                        ref = {**ref, "tool_override": value}
+                return ref
+        return None
+
+    def agent_list(self, node: ast.AST | None, scopes: list[dict]) -> list[dict]:
+        if isinstance(node, ast.Name) and not self._lookup(self.agents, node.id)[0]:
+            node = _unwrap_one_alias(node, scopes)
+        if not isinstance(node, (ast.List, ast.Tuple)):
+            return []
+        return [r for r in (self.agent_ref(e) for e in node.elts) if r]
+
+    def delegates_of(self, expr: ast.AST, scopes: list[dict]) -> list[tuple[dict, str]]:
+        """(ref, via) pairs an expression delegates to: ``x.as_tool()``,
+        ``create_handoff_tool(agent_name="x")``, or a variable bound to one."""
+        if isinstance(expr, ast.Name):
+            found, val = self._lookup(self.delegates, expr.id)
+            return list(val) if found else []
+        if not isinstance(expr, ast.Call):
+            return []
+        if isinstance(expr.func, ast.Attribute) and expr.func.attr == "as_tool":
+            ref = self.agent_ref(expr.func.value)
+            if ref is not None:
+                name_node = _call_kwargs(expr).get("tool_name") or (expr.args[0] if expr.args else None)
+                value, ok = _resolve(name_node, scopes)
+                if ok and isinstance(value, str) and value:
+                    ref = {**ref, "tool_override": value}
+            return [(ref, "as_tool")] if ref else []
+        if self.imports.resolve_call_symbol(expr) in _HANDOFF_TOOL_SYMBOLS:
+            name_node = _call_kwargs(expr).get("agent_name") or (expr.args[0] if expr.args else None)
+            value, ok = _resolve(name_node, scopes)
+            if ok and isinstance(value, str) and value:
+                return [(self.declared_ref(value), "create_handoff_tool")]
+        return []
+
+    def tools_delegates(self, node: ast.AST | None, scopes: list[dict]) -> list[tuple[dict, str]]:
+        if node is None:
+            return []
+        if isinstance(node, ast.Name):
+            if self._lookup(self.delegates, node.id)[1]:  # [] = shadowed: fall through to the alias
+                return self.delegates_of(node, scopes)
+            node = _unwrap_one_alias(node, scopes)
+        elements = node.elts if isinstance(node, (ast.List, ast.Tuple)) else [node]
+        return [pair for e in elements for pair in self.delegates_of(e, scopes)]
+
+    def node_ref(self, action: ast.AST, scopes: list[dict]) -> dict | None:
+        """A graph node's agent: an agent variable/call, or a wrapper
+        function/lambda whose body mentions exactly one resolvable agent."""
+        names: set[str] | None = None
+        if isinstance(action, ast.Name) and not self._lookup(self.agents, action.id)[0]:
+            names = self.func_names.get(action.id)
+        elif isinstance(action, ast.Lambda):
+            names = _expr_names(action.body, set(_param_names(action.args)))
+        if names:
+            refs = [r for r in (self.name_ref(n) for n in sorted(names)) if r]
+            return {"anyof": refs} if refs else None
+        return self.agent_ref(action)
+
+    # ---- hooks called from scan_file's walk ----
+    def on_assign(self, target: str, rhs: ast.AST, scopes: list[dict]) -> None:
+        cur = self.agents[-1]
+        if target in cur:
+            cur[target] = None  # assigned twice in this scope: ambiguous
+        elif self._lookup(self.agents, target)[0] and not self.is_agent_call(rhs):
+            cur[target] = None  # shadows an outer agent with something else
+        # a rebind hides any outer same-named value (not just a local one)
+        self.delegates[-1][target] = []
+        self.tasks[-1][target] = None
+        self.graphs[-1][target] = None
+        pairs = self.delegates_of(rhs, scopes)
+        if pairs:
+            self.delegates[-1][target] = pairs
+
+    def on_agent(
+        self, call: ast.Call, scopes: list[dict], framework: str, symbol: tuple[str, str],
+        assigned_to: str | None, tools_node: ast.AST | None,
+    ) -> None:
+        loc = f"{self.rel}:{call.lineno}"
+        if assigned_to:
+            cur = self.agents[-1]
+            cur[assigned_to] = None if assigned_to in cur else loc
+        kwargs = _call_kwargs(call)
+        declared, ok = _resolve(kwargs.get("name"), scopes)
+        if ok and isinstance(declared, str) and declared:
+            self.agent_names[declared] = None if declared in self.agent_names else loc
+        # `create_react_agent(model, tools=[...])` passes tools by KEYWORD even
+        # though the table's tools spec is positional -- fall back to it.
+        spokes = [
+            _spoke(r, v, _TOOL_FMT_BY_VIA.get(v))
+            for r, v in self.tools_delegates(tools_node or kwargs.get("tools"), scopes)
+        ]
+        for kwarg, holds, via in KNOWN_DELEGATION_KWARGS.get(symbol, ()):
+            # smolagents: only a ToolCallingAgent invokes a managed agent as a
+            # model tool call (a CodeAgent writes code instead)
+            fmt = "raw" if via == "managed_agents" and symbol[1] == "ToolCallingAgent" else _TOOL_FMT_BY_VIA.get(via)
+            if holds == "agents":
+                spokes += [_spoke(r, via, fmt) for r in self.agent_list(kwargs.get(kwarg), scopes)]
+            else:
+                value, ok = _resolve(kwargs.get(kwarg), scopes)
+                if ok and isinstance(value, (list, tuple)):
+                    spokes += [_spoke(self.declared_ref(v), via, fmt) for v in value if isinstance(v, str)]
+        if spokes:
+            self.add_group("delegation", framework, call, hub={"loc": loc}, spokes=spokes)
+
+    def add_group(self, kind: str, framework: str, call: ast.AST, *, hub: dict | None = None,
+                  spokes: list[dict] | None = None, members: list[dict] | None = None,
+                  edges: list[dict] | None = None, report_unresolved: bool = True) -> None:
+        self.groups.append(
+            {
+                "kind": kind, "framework": framework, "file": self.rel, "line": call.lineno, "name": None,
+                "hub": hub, "spokes": spokes or [], "members": members or [], "edges": edges or [],
+                "report_unresolved": report_unresolved,
+            }
+        )
+
+    # ---- StateGraph ----
+    def graph_for_call(self, call: ast.Call) -> dict:
+        graph = self.graph_by_call.get(id(call))
+        if graph is None:
+            graph = {"line": call.lineno, "nodes": {}, "edges": []}
+            self.graph_by_call[id(call)] = graph
+            self.graph_list.append(graph)
+        return graph
+
+    def graph_of(self, expr: ast.AST) -> dict | None:
+        if isinstance(expr, ast.Name):
+            return self._lookup(self.graphs, expr.id)[1]
+        if isinstance(expr, ast.Call):
+            if id(expr) in self.graph_by_call:
+                return self.graph_by_call[id(expr)]
+            if self.imports.resolve_call_symbol(expr) in _GRAPH_CTORS:
+                return self.graph_for_call(expr)
+            if isinstance(expr.func, ast.Attribute) and expr.func.attr in _GRAPH_METHODS:
+                return self.graph_of(expr.func.value)
+        return None
+
+    def method_call(self, call: ast.Call, scopes: list[dict], assigned_to: str | None) -> None:
+        if not isinstance(call.func, ast.Attribute):
+            return
+        method = _GRAPH_METHODS.get(call.func.attr)
+        graph = self.graph_of(call.func.value) if method else None
+        if graph is None:
+            return
+        method(self, graph, call, scopes)
+        if assigned_to:  # `g = StateGraph(S).add_node(...)` chains
+            self.graphs[-1][assigned_to] = graph
+
+    def finish(self) -> list[dict]:
+        for graph in self.graph_list:
+            nodes = graph["nodes"]
+            edges = [
+                {"from": nodes[s], "to": nodes[d], "kind": "task" if via == "destinations" else "sequence", "via": via}
+                for s, d, via in graph["edges"]
+                if nodes.get(s) and nodes.get(d)
+            ]
+            members = [r for r in nodes.values() if r]
+            self.groups.append(
+                {
+                    "kind": "graph", "framework": "langgraph", "file": self.rel, "line": graph["line"],
+                    "name": None, "hub": None, "spokes": [], "members": members, "edges": edges,
+                    "report_unresolved": False,
+                }
+            )
+        return self.groups
+
+
+def _node_names(node: ast.AST | None, scopes: list[dict]) -> list[str]:
+    value, ok = _resolve(node, scopes)
+    if not ok:
+        return []
+    return [v for v in value if isinstance(v, str)] if isinstance(value, (list, tuple)) else (
+        [value] if isinstance(value, str) else []
+    )
+
+
+def _graph_add_node(ctx: _StructureCtx, graph: dict, call: ast.Call, scopes: list[dict]) -> None:
+    kwargs = _call_kwargs(call)
+    first = call.args[0] if call.args else kwargs.get("node")
+    if first is None:
+        return
+    value, ok = _resolve(first, scopes)
+    if ok and isinstance(value, str):
+        name, action = value, (call.args[1] if len(call.args) > 1 else kwargs.get("action"))
+    elif isinstance(first, ast.Name):
+        name, action = first.id, first
+    else:
+        return
+    if action is not None:
+        graph["nodes"][name] = ctx.node_ref(action, scopes)
+        # `destinations=(...)` declares Command/handoff routing: delegation (task)
+        for dest in _node_names(kwargs.get("destinations"), scopes):
+            graph["edges"].append((name, dest, "destinations"))
+
+
+def _graph_add_edge(ctx: _StructureCtx, graph: dict, call: ast.Call, scopes: list[dict]) -> None:
+    kwargs = _call_kwargs(call)
+    start = call.args[0] if call.args else kwargs.get("start_key")
+    end = call.args[1] if len(call.args) > 1 else kwargs.get("end_key")
+    for s in _node_names(start, scopes):
+        for d in _node_names(end, scopes):
+            graph["edges"].append((s, d, "add_edge"))
+
+
+def _graph_add_conditional_edges(ctx: _StructureCtx, graph: dict, call: ast.Call, scopes: list[dict]) -> None:
+    kwargs = _call_kwargs(call)
+    source = call.args[0] if call.args else kwargs.get("source")
+    path_map = call.args[2] if len(call.args) > 2 else kwargs.get("path_map")
+    if isinstance(path_map, ast.Name):
+        path_map = _unwrap_one_alias(path_map, scopes)
+    # per element: a non-literal value (e.g. END) must not drop its siblings
+    elts = path_map.values if isinstance(path_map, ast.Dict) else (
+        path_map.elts if isinstance(path_map, (ast.List, ast.Tuple)) else []
+    )
+    targets = [v for v, ok in (_resolve_one(e, scopes) for e in elts if e is not None) if ok and isinstance(v, str)]
+    for s in _node_names(source, scopes):
+        for d in targets:
+            graph["edges"].append((s, d, "add_conditional_edges"))
+
+
+def _graph_add_sequence(ctx: _StructureCtx, graph: dict, call: ast.Call, scopes: list[dict]) -> None:
+    seq = call.args[0] if call.args else _call_kwargs(call).get("nodes")
+    if isinstance(seq, ast.Name):
+        seq = _unwrap_one_alias(seq, scopes)
+    if not isinstance(seq, (ast.List, ast.Tuple)):
+        return
+    names: list[str | None] = []
+    for elt in seq.elts:
+        if isinstance(elt, (ast.Tuple, ast.List)) and len(elt.elts) == 2:
+            value, ok = _resolve(elt.elts[0], scopes)
+            name, action = (value, elt.elts[1]) if ok and isinstance(value, str) else (None, None)
+        elif isinstance(elt, ast.Name):
+            name, action = elt.id, elt
+        else:
+            name, action = None, None
+        if name and action is not None:
+            graph["nodes"][name] = ctx.node_ref(action, scopes)
+        names.append(name)
+    for a, b in zip(names, names[1:]):
+        if a and b:
+            graph["edges"].append((a, b, "add_sequence"))
+
+
+_GRAPH_METHODS: dict[str, Callable[..., None]] = {
+    "add_node": _graph_add_node,
+    "add_edge": _graph_add_edge,
+    "add_conditional_edges": _graph_add_conditional_edges,
+    "add_sequence": _graph_add_sequence,
+}
+
+
+def _structure_graph_new(ctx: _StructureCtx, call: ast.Call, scopes: list[dict], assigned_to: str | None) -> None:
+    graph = ctx.graph_for_call(call)
+    if assigned_to:
+        ctx.graphs[-1][assigned_to] = graph
+
+
+def _structure_supervisor(ctx: _StructureCtx, call: ast.Call, scopes: list[dict], assigned_to: str | None) -> None:
+    """``create_supervisor([a, b], supervisor_name="x")``: supervisor -> each
+    member (task). The supervisor is built INSIDE the library, so it only
+    counts as a member when a discovered agent is declared with that name=;
+    without an explicit ``supervisor_name`` (the library default is not
+    inferred) the group keeps its members, no edges."""
+    kwargs = _call_kwargs(call)
+    members = ctx.agent_list(call.args[0] if call.args else kwargs.get("agents"), scopes)
+    hub = None
+    if "supervisor_name" in kwargs:
+        value, ok = _resolve(kwargs["supervisor_name"], scopes)
+        if ok and isinstance(value, str) and value:
+            hub = ctx.declared_ref(value)
+    fmt, extra = "lc_transfer", {}
+    if "handoff_tool_prefix" in kwargs:
+        value, ok = _resolve(kwargs["handoff_tool_prefix"], scopes)
+        if ok and isinstance(value, str):
+            extra = {"tool_prefix": value}
+        elif not (ok and value is None):  # None = the library default
+            fmt, extra = "unknown", {"tool_why": "create_supervisor handoff_tool_prefix= is not a string literal"}
+    ctx.add_group(
+        "supervisor", "langgraph", call, hub=hub,
+        spokes=[_spoke(r, "create_supervisor", fmt, **extra) for r in members], members=members,
+    )
+
+
+def _structure_crew_task(ctx: _StructureCtx, call: ast.Call, scopes: list[dict], assigned_to: str | None) -> None:
+    if assigned_to:
+        ctx.tasks[-1][assigned_to] = ctx.agent_ref(_call_kwargs(call).get("agent"))
+
+
+def _is_hierarchical(node: ast.AST | None) -> bool:
+    if isinstance(node, ast.Attribute):
+        return node.attr == "hierarchical"
+    return isinstance(node, ast.Constant) and node.value == "hierarchical"
+
+
+def _structure_crew(ctx: _StructureCtx, call: ast.Call, scopes: list[dict], assigned_to: str | None) -> None:
+    kwargs = _call_kwargs(call)
+    agents = ctx.agent_list(kwargs.get("agents"), scopes)
+    manager = ctx.agent_ref(kwargs["manager_agent"]) if "manager_agent" in kwargs else None
+    if manager is not None or _is_hierarchical(kwargs.get("process")):
+        # hierarchical: manager -> every crew agent. No known manager_agent
+        # (manager_llm only) = members, no edges.
+        ctx.add_group(
+            "crew", "crewai", call, hub=manager, members=agents,
+            spokes=[{"ref": r, "via": "manager_agent"} for r in agents],
+        )
+        return
+    tasks = kwargs.get("tasks")
+    if isinstance(tasks, ast.Name):
+        tasks = _unwrap_one_alias(tasks, scopes)
+    task_refs: list[dict | None] = []
+    for elt in tasks.elts if isinstance(tasks, (ast.List, ast.Tuple)) else []:
+        if isinstance(elt, ast.Name):
+            task_refs.append(ctx._lookup(ctx.tasks, elt.id)[1])
+        elif isinstance(elt, ast.Call) and ctx.imports.resolve_call_symbol(elt) == ("crewai", "Task"):
+            task_refs.append(ctx.agent_ref(_call_kwargs(elt).get("agent")))
+        else:
+            task_refs.append(None)
+    edges = []
+    for prev, cur in zip(task_refs, task_refs[1:]):  # a task with no known agent breaks the chain
+        if prev and cur and prev != cur:
+            edges.append({"from": prev, "to": cur, "kind": "sequence", "via": "task_order"})
+    ctx.add_group("crew", "crewai", call, members=agents + [r for r in task_refs if r], edges=edges)
+
+
+def _structure_agent_workflow(ctx: _StructureCtx, call: ast.Call, scopes: list[dict], assigned_to: str | None) -> None:
+    kwargs = _call_kwargs(call)
+    members = ctx.agent_list(call.args[0] if call.args else kwargs.get("agents"), scopes)
+    ctx.add_group("agent_workflow", "llama-index", call, members=members)  # edges: can_handoff_to, folded in
+
+
+STRUCTURE_HANDLERS: dict[str, Callable[..., None]] = {
+    "graph_new": _structure_graph_new,
+    "supervisor": _structure_supervisor,
+    "crew": _structure_crew,
+    "crew_task": _structure_crew_task,
+    "agent_workflow": _structure_agent_workflow,
+}
+
+
+# -- cross-file second pass (modelled on resolve_agent_links) ----------------
+
+
+def new_structure() -> dict:
+    """Out-param ``scan_file``/``discover_source`` fill (kept off their return
+    tuples so existing 6-tuple callers are untouched)."""
+    return {"groups": [], "files": {}}
+
+
+def _import_table(tree: ast.Module) -> dict[str, tuple[str, str]]:
+    """local name -> (module with leading dots for relative imports, symbol)."""
+    table: dict[str, tuple[str, str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = "." * node.level + (node.module or "")
+            for alias in node.names:
+                if alias.name != "*":
+                    table[alias.asname or alias.name] = (module, alias.name)
+    return table
+
+
+def make_py_locator(files: Any) -> Callable[[str, str], str | None]:
+    """(importing file, module) -> scanned file path, or None. Relative
+    imports resolve exactly; absolute ones by unique path-suffix match (the
+    scan root is not necessarily the package root)."""
+    known = set(files)
+
+    def locate(from_file: str, module: str) -> str | None:
+        level = len(module) - len(module.lstrip("."))
+        parts = [p for p in module.lstrip(".").split(".") if p]
+        if not parts:
+            return None
+        stem = "/".join(parts)
+        if level:
+            base = from_file.split("/")[:-1]
+            base = base[: max(0, len(base) - (level - 1))]
+            path = "/".join([*base, stem])
+            return next((c for c in (path + ".py", path + "/__init__.py") if c in known), None)
+        hits = [
+            f for f in known
+            if any(f == stem + s or f.endswith("/" + stem + s) for s in (".py", "/__init__.py"))
+        ]
+        return hits[0] if len(hits) == 1 else None
+
+    return locate
+
+
+def resolve_agent_groups(
+    raw_groups: list[dict], agents: list[AgentRecord], file_info: dict[str, dict],
+    locate: Callable[[str, str], str | None],
+    warnings: list[str] | None = None,
+    handoff_tools: list[dict] | None = None,
+) -> list[dict]:
+    """Second pass: turn the raw per-file groups (refs still symbolic) into
+    the final ``agent_groups`` -- members/edges as discovered agents, groups
+    with fewer than two resolvable members dropped, delegation fan-outs
+    folded into the workflow/graph that contains them or merged together."""
+    by_loc = {f"{a.file}:{a.line}": a for a in agents}
+    # Two agents declared on one line share a ``file:line`` identity, so a
+    # group touching it cannot be attributed to either one: skip + warn.
+    seen_locs: set[str] = set()
+    dup_locs: set[str] = set()
+    for a in agents:
+        loc = f"{a.file}:{a.line}"
+        (dup_locs if loc in seen_locs else seen_locs).add(loc)
+    declared_global: dict[str, str | None] = {}
+    for info in file_info.values():
+        for name, loc in info["agent_names"].items():
+            declared_global[name] = None if (name in declared_global or loc is None) else loc
+
+    def resolve(ref: dict | None, depth: int = 0) -> str | None:
+        if not ref:
+            return None
+        if "loc" in ref:
+            return ref["loc"] if ref["loc"] in by_loc else None
+        if "anyof" in ref:
+            locs = {resolve(r, depth) for r in ref["anyof"]} - {None}
+            return locs.pop() if len(locs) == 1 else None
+        info = file_info.get(ref["file"])
+        if info is None:
+            return None
+        if "declared" in ref:
+            name = ref["declared"]
+            return info["agent_names"][name] if name in info["agent_names"] else declared_global.get(name)
+        var = ref["var"]
+        if var in info["exports"]:
+            return info["exports"][var]
+        imported = info["imports"].get(var)
+        if imported is None or depth > 3:
+            return None
+        target = locate(ref["file"], imported[0])
+        return resolve({"var": imported[1], "file": target}, depth + 1) if target and target != ref["file"] else None
+
+    def member(loc: str) -> dict:
+        return {"agent": by_loc[loc].name, "agent_location": loc}
+
+    declared_by_loc = {
+        loc: name for info in file_info.values() for name, loc in info["agent_names"].items() if loc
+    }
+    if handoff_tools is not None:
+        # The tool each delegating agent's MODEL calls to hand off (a call the
+        # ForgeBench gateway checks against the agent's allowed tools), named
+        # exactly as the framework emits it. Independent of whether the group
+        # itself survives below.
+        seen_rows: set[tuple[str, str]] = set()
+        for raw in raw_groups:
+            hub = resolve(raw["hub"]) if raw["hub"] else None
+            if hub is None or hub in dup_locs:
+                continue
+            for spoke in raw["spokes"]:
+                fmt = spoke.get("tool_fmt")
+                if not fmt:
+                    continue
+                if fmt == "unknown":  # cannot be derived with confidence: say nothing, don't guess
+                    note = f"{raw['file']}:{raw['line']}: {spoke['tool_why']}; no handoff tools reported for it"
+                    if warnings is not None and note not in warnings:
+                        warnings.append(note)
+                    continue
+                explicit = False
+                target = resolve(spoke["ref"])
+                if fmt == "fixed:handoff":
+                    tool = "handoff"
+                elif target is None or target in dup_locs:
+                    continue
+                elif spoke["ref"].get("tool_override"):
+                    tool, explicit = spoke["ref"]["tool_override"], True
+                elif fmt == "lc_transfer" and "tool_prefix" in spoke:
+                    declared = declared_by_loc.get(target) or by_loc[target].name
+                    tool, explicit = f"{spoke['tool_prefix']}{lc_normalize_agent_name(declared)}", True
+                else:
+                    # the framework names the tool after the agent's DECLARED name=,
+                    # which is not always the variable the record is named after
+                    target_name = declared_by_loc.get(target) or by_loc[target].name
+                    tool = {
+                        "oa_transfer": lambda n: oa_function_tool_name(f"transfer_to_{n}"),
+                        "oa_as_tool": oa_function_tool_name,
+                        "raw": lambda n: n,
+                        "lc_transfer": lambda n: f"transfer_to_{lc_normalize_agent_name(n)}",
+                    }[fmt](target_name)
+                problem = handoff_name_problem(tool)
+                if problem:
+                    if warnings is not None:
+                        warnings.append(f"{raw['file']}:{raw['line']}: handoff tool name {tool!r} skipped: {problem}")
+                    continue
+                if (hub, tool) not in seen_rows:
+                    seen_rows.add((hub, tool))
+                    row = {"agent": by_loc[hub].name, "agent_location": hub, "tool": tool, "handoff": True}
+                    if explicit:
+                        row["explicit_name"] = True
+                    handoff_tools.append(row)
+
+    def build(raw: dict) -> dict | None:
+        locs: list[str] = []
+        unresolved: list[str] = []
+
+        clash: set[str] = set()
+
+        def add(ref: dict | None, report: bool = False) -> str | None:
+            loc = resolve(ref)
+            if loc in dup_locs:
+                clash.add(loc)
+            if loc is None:
+                if report and ref and raw["report_unresolved"] and ("var" in ref or "declared" in ref):
+                    unresolved.append(f"{ref.get('var') or ref.get('declared')!r} is not a discovered agent")
+            elif loc not in locs:
+                locs.append(loc)
+            return loc
+
+        hub = add(raw["hub"])  # a supervisor hub is usually library-built: not an error
+        edges: dict[tuple[str, str], dict] = {}
+
+        def add_edge(src: str | None, dst: str | None, kind: str, via: str) -> None:
+            if src and dst and src != dst:
+                edges.setdefault((src, dst), {"from": member(src), "to": member(dst), "kind": kind, "via": via})
+
+        for spoke in raw["spokes"]:
+            add_edge(hub, add(spoke["ref"], report=True), "task", spoke["via"])
+        for ref in raw["members"]:
+            add(ref, report=True)
+        for edge in raw["edges"]:
+            add_edge(add(edge["from"]), add(edge["to"]), edge["kind"], edge["via"])
+        if clash:
+            if warnings is not None:
+                warnings.append(
+                    f"{raw['file']}:{raw['line']}: agent group skipped (two agents are declared on the same "
+                    f"line: {', '.join(sorted(clash))}); put each agent on its own line"
+                )
+            return None
+        if len(locs) < 2:
+            return None
+        return {
+            "kind": raw["kind"], "framework": raw["framework"], "file": raw["file"], "line": raw["line"],
+            "name": raw["name"], "members": [member(loc) for loc in locs],
+            "edges": list(edges.values()), "unresolved": unresolved,
+        }
+
+    resolved: list[dict] = []
+    for raw in raw_groups:
+        group = build(raw)
+        if group:
+            resolved.append(group)
+    return _merge_delegation_groups(resolved)
+
+
+def _merge_delegation_groups(groups: list[dict]) -> list[dict]:
+    """A ``delegation`` fan-out (one agent + the agents it hands off to) that
+    sits inside a graph/crew/workflow group joins it (task edges win over a
+    flow edge on the same pair); the rest merge when one fan-out nests in the other or they share an agent
+    that is a hub (edge source) in either (a hierarchy chain) -- a merely shared
+    leaf must not fuse two supervisors' teams into one group."""
+
+    def hubs(g: dict) -> set[str]:
+        return {e["from"]["agent_location"] for e in g["edges"]}
+
+    def locs(g: dict) -> set[str]:
+        return {m["agent_location"] for m in g["members"]}
+
+    def absorb(host: dict, other: dict) -> None:
+        seen = {(e["from"]["agent_location"], e["to"]["agent_location"]): e for e in host["edges"]}
+        for e in other["edges"]:
+            key = (e["from"]["agent_location"], e["to"]["agent_location"])
+            if key not in seen:
+                host["edges"].append(e)
+                seen[key] = e
+            elif e["kind"] == "task":
+                seen[key].update(kind="task", via=e["via"])
+        have = locs(host)
+        host["members"] += [m for m in other["members"] if m["agent_location"] not in have]
+        host["unresolved"] += other["unresolved"]
+
+    hosts = [g for g in groups if g["kind"] != "delegation"]
+    loose: list[dict] = []
+    for g in (g for g in groups if g["kind"] == "delegation"):
+        candidates = [h for h in hosts if h["framework"] == g["framework"] and locs(g) <= locs(h)]
+        if candidates:
+            absorb(min(candidates, key=lambda h: len(h["members"])), g)
+        else:
+            loose.append(g)
+    merged: list[dict] = []
+    for g in loose:
+        host = next(
+            (
+                m for m in merged
+                if m["framework"] == g["framework"]
+                and (locs(m) <= locs(g) or locs(g) <= locs(m) or locs(m) & locs(g) & (hubs(m) | hubs(g)))
+            ),
+            None,
+        )
+        if host is None:
+            merged.append(g)
+        else:
+            absorb(host, g)
+    return hosts + merged
+
+
 def scan_file(
-    path: Path, root: Path
+    path: Path, root: Path, structure: dict | None = None
 ) -> tuple[list[CallSiteRecord], list[AgentRecord], list[dict], list[dict], list[dict], list[str]]:
     """Returns (mcp_records, agents, agent_mcp_links_pending, agent_base_tools,
     agent_unresolved_tools, warnings). ``agent_mcp_links_pending`` is
@@ -1610,7 +2448,12 @@ def scan_file(
     keys, not yet resolved to final server names (see
     ``resolve_agent_links``, which needs the full cross-file picture after
     dedup). The other two are already dict-shaped (agent/tool name, or
-    reason) since nothing downstream needs the AST nodes back."""
+    reason) since nothing downstream needs the AST nodes back.
+
+    ``structure`` (from ``new_structure()``) is an OUT-parameter: when given,
+    this file's raw agent-group facts and agent-var exports are added to it
+    for ``resolve_agent_groups`` -- kept off the return tuple so existing
+    6-tuple callers are untouched."""
     warnings: list[str] = []
     empty: tuple = ([], [], [], [], [], warnings)
     try:
@@ -1789,6 +2632,7 @@ def scan_file(
     except ValueError:
         rel = path
     rel_str = str(rel).replace(os.sep, "/")
+    ctx = _StructureCtx(rel_str, import_map, tree)
 
     def _resolve_name_spec(call: ast.Call, spec: tuple, scopes: list[dict], assigned_to: str | None) -> str:
         if spec[0] != "assigned_var":
@@ -1871,6 +2715,18 @@ def scan_file(
                         "reason": f"{value!r} could not be linked to a known MCP server declaration",
                     }
                 )
+            elif kind in ("handoff", "handoff_explicit"):
+                # a delegation tool the MODEL calls: flagged so the CLI can
+                # register it in the tool catalog (it is granted by wiring, not
+                # by an operator reporting it)
+                problem = handoff_name_problem(value)
+                if problem:
+                    warnings.append(f"{rel_str}:{call_line}: handoff tool name {value!r} skipped: {problem}")
+                    continue
+                row = {"agent": agent_name, "agent_location": agent_location, "tool": value, "handoff": True}
+                if kind == "handoff_explicit":
+                    row["explicit_name"] = True
+                agent_base_tools.append(row)
             elif kind == "base":
                 agent_base_tools.append({"agent": agent_name, "agent_location": agent_location, "tool": value})
             else:
@@ -2001,6 +2857,7 @@ def scan_file(
             tool_set_bindings_stack.append({})
             kernel_typed_names_stack.append(set())
             letta_client_typed_names_stack.append(set())
+            ctx.push([*_param_names(node.args), *_non_assign_bindings(node.body)])
             try:
                 for child in ast.iter_child_nodes(node):
                     walk(child, new_scopes)
@@ -2008,6 +2865,7 @@ def scan_file(
                 tool_set_bindings_stack.pop()
                 kernel_typed_names_stack.pop()
                 letta_client_typed_names_stack.pop()
+                ctx.pop()
             return
 
         if isinstance(node, (ast.With, ast.AsyncWith)):
@@ -2076,6 +2934,7 @@ def scan_file(
         if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
             target = node.targets[0].id
             rhs = node.value.value if isinstance(node.value, ast.Await) else node.value
+            ctx.on_assign(target, rhs, scopes)
 
             # `X = adapter.tools` / `X = client.get_tools()` -- a pure
             # lookup against an existing binding, no new call to walk.
@@ -2145,6 +3004,7 @@ def scan_file(
             return
 
         if isinstance(node, ast.Call):
+            ctx.method_call(node, scopes, assigned_to)  # StateGraph builder methods
             # `kernel.add_plugin(MCPStdioPlugin(...))` (Semantic Kernel) --
             # a plain attribute-method call on a LOCAL variable has no
             # import provenance `resolve_call_symbol` could ever confirm
@@ -2367,10 +3227,15 @@ def scan_file(
                             _record_keyed_dict_kwarg(
                                 agent_name, agent_location, _call_kwargs(node).get(keyed_dict_kwarg), scopes
                             )
+                        ctx.on_agent(node, scopes, framework, (known_module, known_symbol), assigned_to, primary_tools_node)
                         break
+                    structure_row = _STRUCTURE_INDEX.get(origin)
+                    if structure_row is not None:
+                        STRUCTURE_HANDLERS[structure_row[0]](ctx, node, scopes, assigned_to)
         for child in ast.iter_child_nodes(node):
             walk(child, scopes)
 
+    ctx.bind_shadowed(_non_assign_bindings(tree.body))
     try:
         walk(tree, [_resolution_env(tree.body)])
     except ValueError as exc:
@@ -2383,6 +3248,13 @@ def scan_file(
         # SyntaxError above, so the rest of this file's already-collected
         # records are kept and every other file still gets scanned.
         warnings.append(f"{path}: skipped rest of file (could not parse a literal: {exc})")
+    if structure is not None:
+        structure["groups"].extend(ctx.finish())
+        structure["files"][rel_str] = {
+            "exports": ctx.agents[0],
+            "agent_names": ctx.agent_names,
+            "imports": _import_table(tree),
+        }
     # A forward reference -- an Agent defined before the MCP declaration
     # its tool-set variable is later assigned from, in the same file -- is
     # a known, accepted gap: `tool_set_bindings` only has entries for
@@ -2453,7 +3325,7 @@ def iter_python_files(root: Path, exclude_dirs: set[str], max_files: int) -> tup
 
 
 def discover_source(
-    root: Path, exclude_dirs: set[str], max_files: int
+    root: Path, exclude_dirs: set[str], max_files: int, structure: dict | None = None
 ) -> tuple[list[CallSiteRecord], list[AgentRecord], list[dict], list[dict], list[dict], list[str]]:
     """Returns (mcp_records, agents, agent_mcp_links_pending, agent_base_tools,
     agent_unresolved_tools, warnings), aggregated across every scanned file.
@@ -2467,7 +3339,7 @@ def discover_source(
     all_base_tools: list[dict] = []
     all_unresolved_tools: list[dict] = []
     for path in files:
-        records, agents, links_pending, base_tools, unresolved_tools, file_warnings = scan_file(path, root)
+        records, agents, links_pending, base_tools, unresolved_tools, file_warnings = scan_file(path, root, structure)
         all_records.extend(records)
         all_agents.extend(agents)
         all_links_pending.extend(links_pending)
@@ -2611,6 +3483,24 @@ def _redact_partial_resolution(record: CallSiteRecord) -> dict[str, Any]:
     return out
 
 
+def merge_handoff_tools(base_tools: list[dict], handoff_tools: list[dict]) -> list[dict]:
+    """``agent_base_tools`` plus the handoff tools found by the structure pass
+    (rows already present, e.g. a ``create_handoff_tool`` in ``tools=``, win)."""
+    have = {(r["agent_location"], r["tool"]) for r in base_tools}
+    return base_tools + [r for r in handoff_tools if (r["agent_location"], r["tool"]) not in have]
+
+
+def describe_group(group: dict) -> str:
+    """``A -> B, C; B -> D`` for a group's edges (members alone when it has
+    none) -- the one-line form the consent listing and the CLI both print."""
+    fanout: dict[str, list[str]] = {}
+    for edge in group["edges"]:
+        fanout.setdefault(edge["from"]["agent"], []).append(edge["to"]["agent"])
+    if not fanout:
+        return ", ".join(m["agent"] for m in group["members"]) + " (no edges found)"
+    return "; ".join(f"{src} -> {', '.join(dsts)}" for src, dsts in fanout.items())
+
+
 def _print_source_consent_listing(
     servers: list[common.ServerConfig],
     unresolved: list[CallSiteRecord],
@@ -2618,6 +3508,7 @@ def _print_source_consent_listing(
     agent_mcp_servers: list[dict],
     agent_base_tools: list[dict],
     agent_unresolved_tools: list[dict],
+    agent_groups: list[dict] | None = None,
 ) -> None:
     common._print_consent_listing(servers)
     if unresolved:
@@ -2638,6 +3529,7 @@ def _print_source_consent_listing(
     if not agents:
         return
     print(f"\nFound {len(agents)} agent declaration(s):")
+    clean = common._sanitize_for_terminal
     # Grouped by (agent, agent_location), NOT agent name alone -- two
     # different agents very plausibly share a display name (e.g. two CrewAI
     # crews each with their own "Researcher" role), and agent_location
@@ -2654,11 +3546,17 @@ def _print_source_consent_listing(
         server_names = ", ".join(sorted(set(servers_by_agent.get((agent.name, location), [])))) or "(none)"
         base_names = ", ".join(sorted(set(base_tools_by_agent.get((agent.name, location), [])))) or "(none)"
         print(
-            f"  - {agent.name} ({agent.framework}) [{agent.file}:{agent.line}]: "
-            f"MCP servers: {server_names}; base tools: {base_names}"
+            clean(
+                f"  - {agent.name} ({agent.framework}) [{agent.file}:{agent.line}]: "
+                f"MCP servers: {server_names}; base tools: {base_names}"
+            )
         )
     if agent_unresolved_tools:
         print(f"  {len(agent_unresolved_tools)} tool reference(s) could not be resolved -- see --out JSON for detail.")
+    if agent_groups:
+        print(f"\nFound {len(agent_groups)} agent group(s) (agents wired together in code):")
+        for group in agent_groups:
+            print(clean(f"  - {group['kind']} ({group['framework']}) [{group['file']}:{group['line']}]: {describe_group(group)}"))
 
 
 def _discovered_source_to_dict(
@@ -2668,6 +3566,7 @@ def _discovered_source_to_dict(
     agent_mcp_servers: list[dict],
     agent_base_tools: list[dict],
     agent_unresolved_tools: list[dict],
+    agent_groups: list[dict] | None = None,
 ) -> dict:
     out = common._discovered_to_dict(servers)
     out["unresolved_call_sites"] = [
@@ -2688,6 +3587,8 @@ def _discovered_source_to_dict(
     out["agent_mcp_servers"] = agent_mcp_servers
     out["agent_base_tools"] = agent_base_tools
     out["agent_unresolved_tools"] = agent_unresolved_tools
+    # Additive: agents wired together in code (see KNOWN_STRUCTURE_SYMBOLS).
+    out["agent_groups"] = agent_groups or []
     return out
 
 
@@ -2776,9 +3677,15 @@ def _main(argv: list[str]) -> int:
 
     exclude_dirs = (set(_DEFAULT_EXCLUDE_DIRS) - set(args.include)) | set(args.exclude)
     root = args.root.resolve()
+    structure = new_structure()
     records, agents, links_pending, agent_base_tools, agent_unresolved_tools, warnings = discover_source(
-        root, exclude_dirs, args.max_files
+        root, exclude_dirs, args.max_files, structure
     )
+    handoff_tools: list[dict] = []
+    agent_groups = resolve_agent_groups(
+        structure["groups"], agents, structure["files"], make_py_locator(structure["files"]), warnings, handoff_tools
+    )
+    agent_base_tools = merge_handoff_tools(agent_base_tools, handoff_tools)
     servers, unresolved, dedupe_warnings, keys_to_server_name = to_servers_and_unresolved(records)
     warnings.extend(dedupe_warnings)
     agent_mcp_servers = resolve_agent_links(links_pending, keys_to_server_name, agent_unresolved_tools)
@@ -2787,9 +3694,9 @@ def _main(argv: list[str]) -> int:
 
     if args.discover_only:
         out_dict = _discovered_source_to_dict(
-            servers, unresolved, agents, agent_mcp_servers, agent_base_tools, agent_unresolved_tools
+            servers, unresolved, agents, agent_mcp_servers, agent_base_tools, agent_unresolved_tools, agent_groups
         )
-        listing = (servers, unresolved, agents, agent_mcp_servers, agent_base_tools, agent_unresolved_tools)
+        listing = (servers, unresolved, agents, agent_mcp_servers, agent_base_tools, agent_unresolved_tools, agent_groups)
         # --out: human listing on stdout, JSON in the file. No --out: the JSON
         # IS stdout (as --out's help always said), listing on stderr, so a
         # caller can capture a parseable document without writing a file.

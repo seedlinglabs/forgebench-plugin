@@ -28,6 +28,7 @@ import json
 import os
 import queue
 import re
+import ssl
 import subprocess
 import threading
 import time
@@ -650,6 +651,30 @@ class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
         return new_req
 
 
+def ssl_context() -> ssl.SSLContext:
+    """Verify HTTPS with the OS trust store when truststore is importable --
+    the parent CLI vendors it, so it is when the bundle runs from the
+    installed package -- so a corporate TLS-inspecting proxy's root (macOS
+    Keychain / Windows store) is honoured. Copied out standalone, this
+    falls back to OpenSSL defaults; FORGEBENCH_CA_BUNDLE adds a root either way."""
+    try:
+        import truststore  # type: ignore[import-not-found]
+    except ImportError:
+        try:
+            from forgebench_session_reviewer._vendor import truststore  # type: ignore[no-redef]
+        except ImportError:
+            truststore = None  # type: ignore[assignment]
+    ctx = (truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT) if truststore
+           else ssl.create_default_context())
+    extra = os.environ.get("FORGEBENCH_CA_BUNDLE")
+    if extra:
+        try:
+            ctx.load_verify_locations(cafile=extra)
+        except OSError:
+            pass  # unreadable extra root: keep the OS store rather than fail
+    return ctx
+
+
 def _dial_http(server: ServerConfig, timeout: float) -> tuple[str, list[str], str | None]:
     """Streamable HTTP (2025-03-26) — wire logic ported from
     apps/control-plane/app/mcp/client.py's LangfuseMCPClient (httpx there,
@@ -660,7 +685,10 @@ def _dial_http(server: ServerConfig, timeout: float) -> tuple[str, list[str], st
     # the default opener's redirect handling has no same-origin check at
     # all. Built once per server so `server.headers`' names (the operator's
     # own credential header names) are known to the redirect guard.
-    opener = urllib.request.build_opener(_SameOriginRedirectHandler(set(server.headers)))
+    opener = urllib.request.build_opener(
+        _SameOriginRedirectHandler(set(server.headers)),
+        urllib.request.HTTPSHandler(context=ssl_context()),
+    )
 
     def _headers() -> dict[str, str]:
         h = {
