@@ -58,9 +58,9 @@ the user what the server says, and relay their choices.
 If no `forgebench_*` tools are available, the server needs a sign-in: ask the
 user to run `/mcp`, pick the forgebench server and choose Authenticate. The
 browser opens: sign in, pick the workspace, approve access. The endpoint
-defaults to `https://api.forgebench.ai/mcp`; set `FORGEBENCH_MCP_URL`
-before starting Claude Code to use another one (for example
-`http://localhost:8000/mcp` for the local stack).
+is the plugin's Forgebench URL option plus `/mcp` (default
+`https://api.forgebench.ai`); change that option, for example to
+`http://localhost:8000` for the local stack, to use another deployment.
 
 Call `forgebench_whoami` first. Tell the user the workspace, their role, the
 granted scopes and the default caps new agents will get. A connection is bound
