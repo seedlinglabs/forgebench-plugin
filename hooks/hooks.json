@@ -1,0 +1,59 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/forgebench_sync_launcher.py",
+            "args": [
+              "${user_config.sync}",
+              "${user_config.forgebench_cli_path}",
+              "sync",
+              "--quiet",
+              "--url",
+              "${user_config.forgebench_url}"
+            ]
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/forgebench_sync_launcher.py",
+            "args": [
+              "${user_config.sync}",
+              "${user_config.forgebench_cli_path}",
+              "sync",
+              "--quiet",
+              "--url",
+              "${user_config.forgebench_url}"
+            ]
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Skill",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/forgebench_sync_launcher.py",
+            "args": [
+              "${user_config.sync}",
+              "${user_config.forgebench_cli_path}",
+              "sync",
+              "--quiet",
+              "--url",
+              "${user_config.forgebench_url}"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

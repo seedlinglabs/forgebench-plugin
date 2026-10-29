@@ -9,7 +9,7 @@
     "url": "https://forgebench.ai"
   },
   "homepage": "https://forgebench.ai",
-  "repository": "https://github.com/seedlinglabs/forgebench-plugin",
+  "repository": "https://github.com/seedlinglabs/forgebench",
   "keywords": [
     "forgebench",
     "mcp",
@@ -17,5 +17,34 @@
     "governance",
     "budgets",
     "onboarding"
-  ]
+  ],
+  "userConfig": {
+    "forgebench_url": {
+      "type": "string",
+      "title": "Forgebench URL",
+      "description": "Base URL of your Forgebench deployment, without a trailing slash. The session sync hooks upload to it.",
+      "default": "https://api.forgebench.ai",
+      "required": false
+    },
+    "forgebench_cli_path": {
+      "type": "string",
+      "title": "Forgebench CLI path",
+      "description": "The forgebench CLI the session sync hooks run: a command name on PATH or an absolute path.",
+      "default": "forgebench",
+      "required": false
+    },
+    "sync": {
+      "type": "boolean",
+      "title": "Sync coding sessions",
+      "description": "Upload this tool's coding sessions to Forgebench. Off: the hooks exit before reading a transcript or starting the CLI. MCP is unaffected.",
+      "default": true,
+      "required": false
+    },
+    "mcp_url": {
+      "type": "string",
+      "title": "Forgebench MCP URL",
+      "description": "The hosted MCP server URL, usually the Forgebench URL plus /mcp. Leave unset to skip the MCP server; sync is unaffected.",
+      "required": false
+    }
+  }
 }
