@@ -10,6 +10,13 @@ from pathlib import Path
 
 PRODUCTION_URL = "https://api.forgebench.ai"
 
+# Source on every branch stays prod-defaulted; a non-prod edition rewrites only the staged copy.
+EDITION_URLS = {
+    "prod": PRODUCTION_URL,
+    "dev": "https://api.dev.forgebench.ai",
+    "staging": "https://api.staging.forgebench.ai",
+}
+
 
 def _ignore_dev_artifacts(source_root: Path):
     """Return a copytree ignore callback preserving runtime scripts."""
@@ -55,8 +62,21 @@ def require_production_url(plugin_dir: Path) -> None:
         )
 
 
-def stage(source: Path, destination: Path) -> None:
+def apply_edition(plugin_dir: Path, edition: str, build: str) -> None:
+    """Point a staged copy at its environment and mark its version as a prerelease."""
+    manifest_path = plugin_dir / ".claude-plugin/plugin.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["version"] = f"{manifest['version']}-{edition}.{build}"
+    manifest["userConfig"]["forgebench_url"]["default"] = EDITION_URLS[edition]
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+
+
+def stage(source: Path, destination: Path, edition: str = "prod", build: str = "") -> None:
     """Copy the plugin and create the public repository marketplace manifest."""
+    if edition not in EDITION_URLS:
+        raise ValueError(f"unknown edition {edition!r}; expected one of {sorted(EDITION_URLS)}")
+    if edition != "prod" and not build.isdigit():
+        raise ValueError("--build must be a number for a dev or staging edition")
     source = source.resolve()
     destination = destination.resolve()
     require_production_url(source)
@@ -68,14 +88,18 @@ def stage(source: Path, destination: Path) -> None:
         raise ValueError(f"destination must be empty: {destination}")
     destination.mkdir(parents=True, exist_ok=True)
     shutil.copytree(source, plugin_destination, ignore=_ignore_dev_artifacts(source))
+    if edition != "prod":
+        apply_edition(plugin_destination, edition, build)
+    # A distinct marketplace name lets a non-prod edition install beside prod (forgebench@forgebench-dev).
+    marketplace_name = "forgebench" if edition == "prod" else f"forgebench-{edition}"
     marketplace_dir = destination / ".claude-plugin"
     marketplace_dir.mkdir()
     (marketplace_dir / "marketplace.json").write_text(
         json.dumps(
             {
-                "name": "forgebench",
+                "name": marketplace_name,
                 "owner": {"name": "forgebench", "url": "https://forgebench.ai"},
-                "description": "The forgebench Claude Code plugin marketplace.",
+                "description": f"The forgebench Claude Code plugin marketplace ({edition}).",
                 "plugins": [
                     {
                         "name": "forgebench",
@@ -90,15 +114,18 @@ def stage(source: Path, destination: Path) -> None:
         )
         + "\n"
     )
-    require_production_url(plugin_destination)
+    if edition == "prod":
+        require_production_url(plugin_destination)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--destination", type=Path, required=True)
+    parser.add_argument("--edition", choices=sorted(EDITION_URLS), default="prod")
+    parser.add_argument("--build", default="", help="build number for the dev/staging prerelease version")
     args = parser.parse_args()
-    stage(args.source, args.destination)
+    stage(args.source, args.destination, args.edition, args.build)
     print(f"Staged plugin at {args.destination / 'plugins/forgebench'}")
     return 0
 

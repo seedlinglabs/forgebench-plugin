@@ -56,3 +56,32 @@ def test_production_url_guard_rejects_dev_artifact(tmp_path):
     )
     assert result.returncode != 0
     assert "must default to https://api.forgebench.ai" in result.stderr
+
+
+def _stage(tmp_path, *extra):
+    staged = tmp_path / "staged"
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "--source", str(PLUGIN_DIR), "--destination", str(staged), *extra],
+        capture_output=True,
+        text=True,
+    )
+    return staged, result
+
+
+def test_dev_and_staging_editions_point_at_their_environment(tmp_path):
+    for edition, url in (("dev", "https://api.dev.forgebench.ai"), ("staging", "https://api.staging.forgebench.ai")):
+        staged, result = _stage(tmp_path / edition, "--edition", edition, "--build", "7")
+        assert result.returncode == 0, result.stderr
+        manifest = json.loads((staged / "plugins/forgebench/.claude-plugin/plugin.json").read_text())
+        assert manifest["userConfig"]["forgebench_url"]["default"] == url
+        assert manifest["version"].endswith(f"-{edition}.7")
+        marketplace = json.loads((staged / ".claude-plugin/marketplace.json").read_text())
+        assert marketplace["name"] == f"forgebench-{edition}"
+    source = json.loads((PLUGIN_DIR / ".claude-plugin/plugin.json").read_text())
+    assert source["userConfig"]["forgebench_url"]["default"] == "https://api.forgebench.ai"
+
+
+def test_non_prod_edition_requires_a_build_number(tmp_path):
+    _, result = _stage(tmp_path, "--edition", "dev")
+    assert result.returncode != 0
+    assert "--build" in result.stderr
