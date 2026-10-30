@@ -1,0 +1,19 @@
+#!/bin/sh
+# Run the Forgebench helper with a Python 3.10+ interpreter, without ever triggering the macOS Command Line
+# Tools installer dialog (the /usr/bin/python3 stub). Hooks stay silent when no interpreter is found.
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin"
+for candidate in python3.14 python3.13 python3.12 python3.11 python3.10 python3 python; do
+  path=$(command -v "$candidate" 2>/dev/null) || continue
+  if [ "$path" = /usr/bin/python3 ] && [ "$(uname)" = Darwin ] && ! xcode-select -p >/dev/null 2>&1; then
+    continue
+  fi
+  if "$path" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
+    exec "$path" "$HERE/forgebench_helper.py" "$@"
+  fi
+done
+if [ "$1" = hook ]; then
+  exit 0
+fi
+echo "forgebench: Python 3.10 or newer is required to run the Forgebench helper (not found on PATH)." >&2
+exit 127

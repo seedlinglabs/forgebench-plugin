@@ -9,7 +9,9 @@ server cannot ship by itself:
 | Onboarding skill | `skills/forgebench-onboarding/SKILL.md` | The scan, review, plan and apply flow, budgets and limits, and browser-only agent keys. Loaded when you ask Claude to onboard a repo, change a budget or get an agent key. |
 | Integration skill | `skills/forgebench-integrate/SKILL.md` | Integrating forgebench into a developer's own app: the gateway base URL, env vars, request parameters, metadata, sessions, streaming, error handling, agent keys and tool gating, using the `forgebench_integrate recipe` tool and checking the result with `forgebench_integrate verify`. |
 | Local scanner | `scripts/forgebench_scan.py` | Finds agents and MCP servers in a repository and uploads a minimal `forgebench.scan/v1` payload straight to forgebench with a single-use ticket. Prints only counts and a sha256. Needs Python 3.10+. |
-| Sync hooks | `hooks/hooks.json`, `scripts/forgebench_sync_launcher.py` | Three exec-form hooks (SessionStart, SessionEnd, and PostToolUse for the `Skill` matcher) run the launcher, which starts `forgebench sync --quiet --url <url>` fully detached (double fork) and returns at once, inside the fixed 1.5 s SessionEnd budget. With the `sync` option off it exits before reading anything. POSIX only (#1060); without `fork`/`setsid` the launcher exits without syncing, and the Windows detach is #1146. Needs the `forgebench` CLI (see the `forgebench_cli_path` option). |
+| Setup skill | `skills/setup/SKILL.md` | `/forgebench:setup`: browser sign-in, gateway routing, native OpenTelemetry, status, task selection and disconnect, all without the forgebench CLI. Runs the helper below. |
+| Helper | `scripts/forgebench-run`, `scripts/forgebench_helper.py`, `scripts/fbplugin/` | Standard-library Python 3.10+ (macOS and Linux). Signs in with PKCE in the browser; writes only its own keys in user-scope `settings.json` (`ANTHROPIC_BASE_URL`, `apiKeyHelper`, `ANTHROPIC_CUSTOM_HEADERS`, the OTel exporter and `otelHeadersHelper`) with an ownership receipt, and restores them on disconnect; serves the `apiKeyHelper` and `otelHeadersHelper` credentials; posts session context to `/v1/sessions/meta` from the SessionStart and SessionEnd hooks. Never needs, finds or runs the CLI. |
+| Sync hooks | `hooks/hooks.json`, `scripts/forgebench_sync_launcher.py` | Optional, for machines that also have the CLI: three exec-form hooks (SessionStart, SessionEnd, and PostToolUse for the `Skill` matcher) run the launcher, which starts `forgebench sync --quiet --url <url>` fully detached (double fork) and returns at once, inside the fixed 1.5 s SessionEnd budget. With the `sync` option off it exits before reading anything. POSIX only (#1060); without `fork`/`setsid` the launcher exits without syncing, and the Windows detach is #1146. Uses the `forgebench` CLI when it is installed (see the `forgebench_cli_path` option) and does nothing without it. |
 | Options | `userConfig` in `.claude-plugin/plugin.json` | `forgebench_url` (default `https://api.forgebench.ai`, where sync uploads), `forgebench_cli_path` (default `forgebench`, found on `PATH` or in `~/.local/bin`), `sync` (Boolean, default on) and `mcp_url` (no default). None is sensitive. |
 | Manifests | `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json` | The plugin, and a one-plugin marketplace so this directory can be added as a marketplace. |
 
@@ -51,6 +53,25 @@ Try it: *"onboard this repo to forgebench"*, *"set Researcher's monthly budget
 to 40 dollars"*, *"give me a key for Researcher"*. The server's prompts
 `onboard_repo`, `set_up_budgets` and `org_rollout_status` also appear in the
 `/` menu, marked (MCP).
+
+### Connect Claude Code itself (no CLI)
+
+The MCP sign-in above is for the forgebench tools. To route Claude Code's own
+model calls through the gateway and report sessions, run
+`/forgebench:setup connect` (or ask *"connect Claude Code to forgebench"*). The
+skill signs you in through the browser, asks before turning on gateway
+routing (routed calls use a forgebench credential instead of your claude.ai
+login) and telemetry, and writes the configuration. Restart Claude Code
+afterwards. `/forgebench:setup status` shows what is connected, and
+`/forgebench:setup disconnect` restores your settings.
+
+Known gaps, all on the server side: until the control plane hands a model
+credential to the plugin at sign-in (the `plugin_contract` marker), connect is
+reporting-only and gateway routing is reported as unsupported. The
+session-context confirmation (`capture_contract`) and the telemetry delivery
+endpoint are not implemented yet either, so `status` shows context as sent but
+unconfirmed. Per-session usage from transcripts still comes from the optional
+CLI sync.
 
 ### Server only (no skill, no scanner)
 

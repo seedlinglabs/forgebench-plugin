@@ -56,21 +56,42 @@ def _hook_entries() -> dict[str, list[dict]]:
 # --- manifests -----------------------------------------------------------------------------------
 
 
+HELPER_RUN = "${CLAUDE_PLUGIN_ROOT}/scripts/forgebench-run"
+LAUNCHER_CMD = "${CLAUDE_PLUGIN_ROOT}/scripts/forgebench_sync_launcher.py"
+
+
+def _by_command(event: str, command: str) -> dict:
+    [entry] = [e for e in _hook_entries()[event] if e["hook"]["command"] == command]
+    return entry
+
+
 def test_only_the_three_default_sync_hooks():
     entries = _hook_entries()
     assert set(entries) == {"SessionStart", "SessionEnd", "PostToolUse"}  # no Stop (--on-stop) etc.
-    for event, [entry] in entries.items():
-        assert entry["matcher"] == ("Skill" if event == "PostToolUse" else None), event
+    for event, items in entries.items():
+        # SessionStart/SessionEnd: the CLI-free helper first, then the optional CLI sync launcher.
+        commands = [e["hook"]["command"] for e in items]
+        assert commands == ([LAUNCHER_CMD] if event == "PostToolUse" else [HELPER_RUN, LAUNCHER_CMD]), event
+        for entry in items:
+            assert entry["matcher"] == ("Skill" if event == "PostToolUse" else None), event
     flat = json.dumps(_json("hooks/hooks.json"))
     for forbidden in ("--on-stop", "task_context", "task-context", "session_association", "session-association"):
         assert forbidden not in flat, forbidden
 
 
+def test_session_hooks_run_the_cli_free_helper_in_exec_form():
+    for event in ("SessionStart", "SessionEnd"):
+        hook = _by_command(event, HELPER_RUN)["hook"]
+        assert hook == {"type": "command", "command": HELPER_RUN, "args": [
+            "hook", event, "--sync", "${user_config.sync}", "--url", "${user_config.forgebench_url}"]}, event
+    run = PLUGIN / "scripts" / "forgebench-run"
+    assert run.is_file() and os.access(run, os.X_OK), "the hook command must be executable"
+
+
 def test_hooks_are_exec_form_and_call_the_launcher():
-    for event, [entry] in _hook_entries().items():
-        hook = entry["hook"]
+    for event in _hook_entries():
+        hook = _by_command(event, LAUNCHER_CMD)["hook"]
         assert hook["type"] == "command", event
-        assert hook["command"] == "${CLAUDE_PLUGIN_ROOT}/scripts/forgebench_sync_launcher.py", event
         # Exec form: arguments are a list, not a shell string.
         assert hook["args"] == [
             "${user_config.sync}",

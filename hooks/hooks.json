@@ -5,6 +5,18 @@
         "hooks": [
           {
             "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/forgebench-run",
+            "args": [
+              "hook",
+              "SessionStart",
+              "--sync",
+              "${user_config.sync}",
+              "--url",
+              "${user_config.forgebench_url}"
+            ]
+          },
+          {
+            "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/scripts/forgebench_sync_launcher.py",
             "args": [
               "${user_config.sync}",
@@ -21,6 +33,18 @@
     "SessionEnd": [
       {
         "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/forgebench-run",
+            "args": [
+              "hook",
+              "SessionEnd",
+              "--sync",
+              "${user_config.sync}",
+              "--url",
+              "${user_config.forgebench_url}"
+            ]
+          },
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/scripts/forgebench_sync_launcher.py",
