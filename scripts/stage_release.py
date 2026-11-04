@@ -45,6 +45,7 @@ def require_production_url(plugin_dir: Path) -> None:
         mcp = json.loads((plugin_dir / ".mcp.json").read_text())
         default = plugin["userConfig"]["forgebench_url"]["default"]
         configured_url = mcp["mcpServers"]["forgebench"]["url"]
+        mcp_default = plugin["userConfig"]["mcp_url"]["default"]
     except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
         raise ValueError(f"invalid plugin URL configuration: {exc}") from exc
 
@@ -52,6 +53,9 @@ def require_production_url(plugin_dir: Path) -> None:
         raise ValueError(
             f"plugin must default to {PRODUCTION_URL} (got {default!r})"
         )
+
+    if mcp_default != f"{PRODUCTION_URL}/mcp":
+        raise ValueError(f"plugin MCP must default to {PRODUCTION_URL}/mcp (got {mcp_default!r})")
 
     valid_mcp_urls = ("${user_config.mcp_url}", f"{PRODUCTION_URL}/mcp", "${user_config.forgebench_url}/mcp")
     resolved = configured_url.replace("${user_config.forgebench_url}", default)
@@ -68,6 +72,7 @@ def apply_edition(plugin_dir: Path, edition: str, build: str) -> None:
     manifest = json.loads(manifest_path.read_text())
     manifest["version"] = f"{manifest['version']}-{edition}.{build}"
     manifest["userConfig"]["forgebench_url"]["default"] = EDITION_URLS[edition]
+    manifest["userConfig"]["mcp_url"]["default"] = f"{EDITION_URLS[edition]}/mcp"
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
 
 

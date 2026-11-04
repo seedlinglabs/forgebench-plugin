@@ -58,6 +58,22 @@ def test_production_url_guard_rejects_dev_artifact(tmp_path):
     assert "must default to https://api.forgebench.ai" in result.stderr
 
 
+
+def test_production_url_guard_rejects_wrong_mcp_default(tmp_path):
+    plugin = tmp_path / "plugin"
+    shutil.copytree(PLUGIN_DIR, plugin)
+    manifest_path = plugin / ".claude-plugin/plugin.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["userConfig"]["mcp_url"]["default"] = "https://api.dev.forgebench.ai/mcp"
+    manifest_path.write_text(json.dumps(manifest))
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "--source", str(plugin), "--destination", str(tmp_path / "staged")],
+        capture_output=True, text=True,
+    )
+    assert result.returncode != 0
+    assert "MCP must default to https://api.forgebench.ai/mcp" in result.stderr
+
+
 def _stage(tmp_path, *extra):
     staged = tmp_path / "staged"
     result = subprocess.run(
@@ -74,6 +90,7 @@ def test_dev_and_staging_editions_point_at_their_environment(tmp_path):
         assert result.returncode == 0, result.stderr
         manifest = json.loads((staged / "plugins/forgebench/.claude-plugin/plugin.json").read_text())
         assert manifest["userConfig"]["forgebench_url"]["default"] == url
+        assert manifest["userConfig"]["mcp_url"]["default"] == f"{url}/mcp"
         assert manifest["version"].endswith(f"-{edition}.7")
         marketplace = json.loads((staged / ".claude-plugin/marketplace.json").read_text())
         assert marketplace["name"] == f"forgebench-{edition}"

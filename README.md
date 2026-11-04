@@ -5,12 +5,12 @@ server cannot ship by itself:
 
 | Part | Path | What it does |
 |---|---|---|
-| MCP server entry | `.mcp.json` | An HTTP server named `forgebench` at the `mcp_url` option (no default: unset means the server is skipped). Sign-in is OAuth in the browser; no API key is configured anywhere. |
+| MCP server entry | `.mcp.json` | An HTTP server named `forgebench` at the `mcp_url` option (defaults to `https://api.forgebench.ai/mcp`). Sign-in is OAuth in the browser; no API key is configured anywhere. |
 | Onboarding skill | `skills/forgebench-onboarding/SKILL.md` | The scan, review, plan and apply flow, budgets and limits, and browser-only agent keys. Loaded when you ask Claude to onboard a repo, change a budget or get an agent key. |
 | Integration skill | `skills/forgebench-integrate/SKILL.md` | Integrating forgebench into a developer's own app: the gateway base URL, env vars, request parameters, metadata, sessions, streaming, error handling, agent keys and tool gating, using the `forgebench_integrate recipe` tool and checking the result with `forgebench_integrate verify`. |
 | Local scanner | `scripts/forgebench_scan.py` | Finds agents and MCP servers in a repository and uploads a minimal `forgebench.scan/v1` payload straight to forgebench with a single-use ticket. Prints only counts and a sha256. Needs Python 3.10+. |
 | Sync hooks | `hooks/hooks.json`, `scripts/forgebench_sync_launcher.py` | Three exec-form hooks (SessionStart, SessionEnd, and PostToolUse for the `Skill` matcher) run the launcher, which starts `forgebench sync --quiet --url <url>` fully detached (double fork) and returns at once, inside the fixed 1.5 s SessionEnd budget. With the `sync` option off it exits before reading anything. POSIX only (#1060); without `fork`/`setsid` the launcher exits without syncing, and the Windows detach is #1146. Needs the `forgebench` CLI (see the `forgebench_cli_path` option). |
-| Options | `userConfig` in `.claude-plugin/plugin.json` | `forgebench_url` (default `https://api.forgebench.ai`, where sync uploads), `forgebench_cli_path` (default `forgebench`, found on `PATH` or in `~/.local/bin`), `sync` (Boolean, default on) and `mcp_url` (no default). None is sensitive. |
+| Options | `userConfig` in `.claude-plugin/plugin.json` | `forgebench_url` (default `https://api.forgebench.ai`, where sync uploads), `forgebench_cli_path` (default `forgebench`, found on `PATH` or in `~/.local/bin`), `sync` (Boolean, default on) and `mcp_url` (default `https://api.forgebench.ai/mcp`). None is sensitive. |
 | Manifests | `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json` | The plugin, and a one-plugin marketplace so this directory can be added as a marketplace. |
 
 The server-side design, threat model and an end-to-end test runbook are in
@@ -20,8 +20,8 @@ The server-side design, threat model and an end-to-end test runbook are in
 
 You need a running control plane (the local stack serves it at
 `http://localhost:8000`) and Claude Code. The plugin connects to production
-(`https://api.forgebench.ai`) by default and registers no MCP server until
-`mcp_url` is set, so point both at the local stack when you install. From the
+(`https://api.forgebench.ai`) by default and its MCP server defaults to `https://api.forgebench.ai/mcp`,
+so point both at the local stack when you install. From the
 repository root:
 
 ```bash
@@ -70,6 +70,31 @@ server reads the `mcp_url` option (`.mcp.json`: `${user_config.mcp_url}`, the
 full URL including `/mcp`). Set them at install time with `--config` or change
 them from the plugin's configuration in `/plugin`.
 
+For a custom or on-premises deployment, use its API origin in both options:
+
+```bash
+claude plugin marketplace add seedlinglabs/forgebench-plugin
+claude plugin install forgebench@forgebench \
+  --config forgebench_url=https://forgebench.example.com \
+  --config mcp_url=https://forgebench.example.com/mcp
+```
+
+For an existing installation, update both values:
+
+```bash
+echo '{"forgebench_url":"https://forgebench.example.com","mcp_url":"https://forgebench.example.com/mcp"}' | claude plugin configure forgebench@forgebench --values-stdin
+```
+
+Restart Claude Code or run `/reload-plugins`, then choose **forgebench →
+Authenticate** in `/mcp`. Sign in with your organization's identity provider,
+choose a workspace if prompted, and approve access. Claude Code discovers OAuth
+from the deployment; it needs no API key, client secret, or separate client
+registration. The deployment administrator must configure the externally
+reachable HTTPS API origin (`NEXT_PUBLIC_API_URL`, or Helm `config.publicApiUrl`),
+the identity provider, and a stable `STUDIO_KEK` shared across replicas. Both
+`/.well-known/oauth-protected-resource/mcp` and
+`/.well-known/oauth-authorization-server` should return metadata at that origin.
+
 Organizations do not need either step: an admin gets managed settings that
 deliver the server and this plugin to every developer from
 `forgebench_rollout_kit` (see [`docs/HOSTED-MCP.md`](../../docs/HOSTED-MCP.md)).
@@ -79,7 +104,7 @@ one and the sync hooks upload to the same deployment, on staging, dev or
 self-hosted as much as on production. Claude Code reads plugin options from
 user settings, `--settings` and managed settings, and managed settings win over
 a developer's own value. Without a managed value the sync default stays
-production and MCP stays off.
+production and MCP defaults to the production endpoint.
 
 The launcher also checks the `forgebench_url` it is given: a trailing slash is
 removed, and plain `http://` is accepted only for `localhost`, `127.0.0.1` and
@@ -97,7 +122,7 @@ plugin disabled or uninstalled, and neither uses `disableAllHooks`.
 - **Sync**: the `sync` option (default on). Off, the hooks still fire but the
   launcher exits before it reads the transcript, starts the CLI or uploads.
 - **MCP**: the `mcp_url` option. Pass `--config mcp_url=<url>` on install to
-  enable it; to skip it, leave the flag out. **Never pass an empty
+  override the production default. To skip it, configure an empty value after installation. **Never pass an empty
   `--config mcp_url=`**: Claude Code 2.1.311 rejects the empty value while the
   install can still exit 0.
 
@@ -111,7 +136,7 @@ echo '{"mcp_url": "https://api.forgebench.ai/mcp"}' | claude plugin configure fo
 echo '{"sync": "false"}' | claude plugin configure forgebench@forgebench --values-stdin  # sync off, MCP kept
 ```
 
-With `mcp_url` unset or empty, Claude Code makes no connection, but `/mcp` and
+With `mcp_url` explicitly empty, Claude Code makes no connection, but `/mcp` and
 `claude mcp get plugin:forgebench:forgebench` show **Failed to connect** with
 "URL is unset or invalid" (verified on 2.1.306 and 2.1.311), not "Not configured". That is the expected
 display for skipped MCP; set `mcp_url` to turn it back on.
