@@ -100,19 +100,19 @@ def test_user_config_declares_url_cli_path_sync_and_mcp_url():
     # Hooks live in hooks/hooks.json and the server in .mcp.json, found at their default paths.
     for field in ("hooks", "mcpServers"):
         assert field not in plugin, field
-    # Every ${user_config.KEY} the plugin uses is declared.
+    # Every ${user_config.KEY} the plugin uses is declared; mcp_url is kept but no longer referenced.
     used = set()
     for rel in ("hooks/hooks.json", ".mcp.json"):
         text = (PLUGIN / rel).read_text(encoding="utf-8")
         used |= {part.split("}")[0] for part in text.split("${user_config.")[1:]}
-    assert used == set(config)
+    assert used == set(config) - {"mcp_url"}
 
 
-def test_mcp_json_url_comes_from_user_config_never_the_dev_default():
+def test_mcp_json_url_is_the_literal_production_url():
     servers = _json(".mcp.json")["mcpServers"]
     assert list(servers) == ["forgebench"]
-    # The full URL is independent of the base URL used by sync hooks.
-    assert servers["forgebench"] == {"type": "http", "url": "${user_config.mcp_url}"}
+    # Literal: the Claude desktop app does not apply userConfig defaults, so a ${user_config.*} ref resolves empty.
+    assert servers["forgebench"] == {"type": "http", "url": f"{PROD_URL}/mcp"}
     for rel in (".mcp.json", "hooks/hooks.json", ".claude-plugin/plugin.json"):
         assert "dev.forgebench.ai" not in (PLUGIN / rel).read_text(encoding="utf-8"), rel
 
@@ -313,7 +313,7 @@ def test_url_is_normalised_before_upload(fake_cli, tmp_path, url, expected):
 
 
 @posix_only
-@pytest.mark.parametrize("url", ["http://x.test", "http://10.0.0.5:8000", "ftp://x.test", "", "x.test", "https://"])
+@pytest.mark.parametrize("url", ["http://x.test", "http://10.0.0.5:8000", "ftp://x.test", "x.test", "https://"])
 def test_insecure_or_invalid_url_uploads_nothing(fake_cli, tmp_path, url):
     result, _ = _run_launcher(fake_cli.as_posix(), url=url, payload=b'{"session_id": "abc"}')
     assert result.returncode == 0 and result.stdout == b"" and result.stderr == b""
@@ -398,6 +398,29 @@ def test_explicit_url_beats_the_env_fallback(fake_cli, tmp_path):
 
 
 @posix_only
+@pytest.mark.parametrize("args", [["sync", "--quiet", "--url", ""], ["sync", "--quiet", "--url", "${user_config.forgebench_url}"], ["sync", "--quiet", "--url"]])
+def test_empty_url_falls_back_to_the_manifest_default(fake_cli, tmp_path, args):
+    _run_launcher(fake_cli.as_posix(), args=args)
+    assert _wait_for(tmp_path / "started", 5)
+    assert (tmp_path / "argv").read_text().strip() == f"sync --quiet --url {PROD_URL}"
+
+
+@posix_only
+def test_empty_url_in_a_staged_dev_edition_uses_the_dev_url_not_prod(fake_cli, tmp_path, monkeypatch):
+    plugin = tmp_path / "plugin"
+    (plugin / ".claude-plugin").mkdir(parents=True)
+    (plugin / "scripts").mkdir()
+    manifest = _json(".claude-plugin/plugin.json")
+    manifest["userConfig"]["forgebench_url"]["default"] = "https://api.dev.forgebench.ai"
+    (plugin / ".claude-plugin/plugin.json").write_text(json.dumps(manifest))
+    (plugin / "scripts/forgebench_sync_launcher.py").write_text(LAUNCHER.read_text())
+    monkeypatch.setattr(sys.modules[__name__], "LAUNCHER", plugin / "scripts/forgebench_sync_launcher.py")
+    _run_launcher(fake_cli.as_posix(), url="")
+    assert _wait_for(tmp_path / "started", 5)
+    assert (tmp_path / "argv").read_text().strip() == "sync --quiet --url https://api.dev.forgebench.ai"
+
+
+@posix_only
 def test_production_default_stays_production_without_the_env(fake_cli, tmp_path):
     _run_launcher(fake_cli.as_posix(), url=PROD_URL + "/", env={"FORGEBENCH_MCP_URL": ""})
     assert _wait_for(tmp_path / "started", 5)
@@ -459,8 +482,8 @@ def listener():
 
 
 @real_claude
-def test_real_claude_mcp_and_sync_options_are_independent(tmp_path, listener):
-    """A configured URL reaches only the loopback endpoint; options remain independent."""
+def test_real_claude_mcp_is_not_redirected_by_options(tmp_path, listener):
+    """Options never redirect the hard-coded MCP URL."""
     base, hits = listener
     home = tmp_path / "home"
     redirects = ("ANTHROPIC_", "CLAUDE_CODE_USE_", "CLAUDE_CONFIG_DIR", "FORGEBENCH_")
@@ -495,14 +518,9 @@ def test_real_claude_mcp_and_sync_options_are_independent(tmp_path, listener):
     claude("plugin", "install", "forgebench@forgebench", "--config", f"forgebench_url={base}")
     assert "mcp_url" not in options()
 
-    configure({"mcp_url": f"{base}/mcp"})
+    # MCP is hard-coded to production: no option redirects it to the loopback listener.
     mcp_status()
-    assert hits and all(hit.split()[1] == "/mcp" for hit in hits), hits
+    assert hits == [], hits
 
     configure({"sync": "false"})
-    assert options() == {"forgebench_url": base, "mcp_url": f"{base}/mcp", "sync": False}
-
-    configure({"mcp_url": ""})
-    assert options() == {"forgebench_url": base, "mcp_url": "", "sync": False}
-    status = mcp_status()
-    assert hits == [] and "URL is unset or invalid" in status, (hits, status)
+    assert options() == {"forgebench_url": base, "sync": False}
