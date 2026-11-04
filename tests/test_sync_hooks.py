@@ -3,7 +3,7 @@
 
 The manifest tests pin the shape Claude Code reads (exec-form hooks, only the
 three default sync hooks, URL, CLI path, sync switch and MCP URL from
-``userConfig``, a production default, no MCP URL default). The launcher tests run the script the way a hook does, as a
+``userConfig``, production defaults). The launcher tests run the script the way a hook does, as a
 subprocess, against a fake CLI that records what it received and writes marker
 files: the launcher must return well inside the 1.5 s SessionEnd budget, hand
 the hook payload to the CLI on stdin, and leave the CLI running after the
@@ -92,8 +92,7 @@ def test_user_config_declares_url_cli_path_sync_and_mcp_url():
     assert config["forgebench_url"]["default"] == PROD_URL
     assert config["forgebench_cli_path"]["default"] == "forgebench"
     assert config["sync"]["type"] == "boolean" and config["sync"]["default"] is True  # D15: on for compatibility
-    # D15: no default, so a skipped MCP stays unset; the CLI or a managed rollout supplies the URL.
-    assert config["mcp_url"]["type"] == "string" and "default" not in config["mcp_url"]
+    assert config["mcp_url"]["type"] == "string" and config["mcp_url"]["default"] == f"{PROD_URL}/mcp"
     for key, option in config.items():
         assert option["type"] in {"string", "boolean"} and option["title"] and option["description"], key
         assert option.get("required") is False, key
@@ -112,8 +111,7 @@ def test_user_config_declares_url_cli_path_sync_and_mcp_url():
 def test_mcp_json_url_comes_from_user_config_never_the_dev_default():
     servers = _json(".mcp.json")["mcpServers"]
     assert list(servers) == ["forgebench"]
-    # The whole URL is the option, not the base URL plus /mcp: an unset mcp_url skips MCP
-    # without clearing the base URL the sync hooks upload to.
+    # The full URL is independent of the base URL used by sync hooks.
     assert servers["forgebench"] == {"type": "http", "url": "${user_config.mcp_url}"}
     for rel in (".mcp.json", "hooks/hooks.json", ".claude-plugin/plugin.json"):
         assert "dev.forgebench.ai" not in (PLUGIN / rel).read_text(encoding="utf-8"), rel
@@ -462,9 +460,7 @@ def listener():
 
 @real_claude
 def test_real_claude_mcp_and_sync_options_are_independent(tmp_path, listener):
-    """D15 against the installed CLI: unset or empty mcp_url makes no request, a set one reaches only
-    that endpoint, and changing either option keeps the other. Only the loopback listener is
-    reachable by URL here; "no request to any host" relies on the URL being empty."""
+    """A configured URL reaches only the loopback endpoint; options remain independent."""
     base, hits = listener
     home = tmp_path / "home"
     redirects = ("ANTHROPIC_", "CLAUDE_CODE_USE_", "CLAUDE_CONFIG_DIR", "FORGEBENCH_")
@@ -498,10 +494,6 @@ def test_real_claude_mcp_and_sync_options_are_independent(tmp_path, listener):
     claude("plugin", "marketplace", "add", str(PLUGIN))
     claude("plugin", "install", "forgebench@forgebench", "--config", f"forgebench_url={base}")
     assert "mcp_url" not in options()
-
-    status = mcp_status()
-    assert hits == [], "an unset mcp_url must not connect anywhere"
-    assert "URL is unset or invalid" in status, status  # the native text, not "Not configured"
 
     configure({"mcp_url": f"{base}/mcp"})
     mcp_status()
