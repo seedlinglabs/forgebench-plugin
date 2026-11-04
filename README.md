@@ -99,31 +99,49 @@ Helm `config.publicApiUrl`), the identity provider, and a stable `STUDIO_KEK`
 shared across replicas. Both `/.well-known/oauth-protected-resource/mcp` and
 `/.well-known/oauth-authorization-server` should return metadata at that origin.
 
-Organizations do not need either step: an admin gets managed settings that
-deliver the server and this plugin to every developer from
+Organizations can deliver this plugin through managed settings from
 `forgebench_rollout_kit` (see [`docs/HOSTED-MCP.md`](../../docs/HOSTED-MCP.md)).
-The kit sets `pluginConfigs["forgebench@forgebench"].options.forgebench_url` to
-the deployment's own URL (and `options.mcp_url`, now ignored), so the plugin's MCP server collapses into the managed
-one and the sync hooks upload to the same deployment, on staging, dev or
-self-hosted as much as on production. Claude Code reads plugin options from
-user settings, `--settings` and managed settings, and managed settings win over
-a developer's own value. Without a managed value the sync default stays
-production and MCP uses the production endpoint.
+The kit sets `pluginConfigs["forgebench@forgebench"].options.forgebench_url` to the
+deployment's own URL; Claude Code reads plugin options from user settings,
+`--settings` and managed settings, and managed settings win over a developer's own
+value. **The plugin's MCP server no longer follows these settings:** `.mcp.json` is
+fixed to the edition's own URL, so `options.mcp_url` does not collapse the plugin's
+server into a managed one. An organization on a non-prod or self-hosted deployment
+that installs the prod edition therefore gets MCP pointed at production
+(`https://api.forgebench.ai/mcp`) while sync follows `forgebench_url` (or
+`FORGEBENCH_MCP_URL`) to their own deployment. Such organizations must deliver their
+MCP server directly through managed settings and should not rely on this plugin's.
+Without a managed value, sync defaults to the edition's URL (production for the prod
+edition).
 
-The launcher also checks the `forgebench_url` it is given: an empty value (the desktop app does not apply defaults) falls back to the manifest default, a trailing slash is
-removed, and plain `http://` is accepted only for `localhost`, `127.0.0.1` and
-`::1` (session content is not sent over cleartext to anything else); any other
-URL uploads nothing. If the option is still the production default and the
-managed settings set `env.FORGEBENCH_MCP_URL` (the rollout kit does), the
-launcher uploads to that deployment instead, a fallback in case Claude Code
-does not honour the managed `pluginConfigs` entry.
+Hook options are read by the launcher from the `CLAUDE_PLUGIN_OPTION_SYNC`,
+`CLAUDE_PLUGIN_OPTION_FORGEBENCH_URL` and `CLAUDE_PLUGIN_OPTION_FORGEBENCH_CLI_PATH`
+environment variables (the hooks pass only `sync --quiet`). Each value loses
+surrounding whitespace and one layer of quotes. If a variable is empty or
+unsubstituted (the desktop app does not apply defaults), the staged manifest's
+default is used; if the manifest is missing or corrupt, sync is skipped silently
+(a broken dev edition never syncs to production).
+
+The launcher validates the URL: a trailing slash is removed, and it must be
+`https://` with no user info or whitespace. Plain `http://` is accepted only for
+`localhost`, `127.0.0.1` and `::1`; any other URL uploads nothing. If the option is
+still the production default and the managed settings set `env.FORGEBENCH_MCP_URL`
+(the rollout kit does), the launcher uploads to that deployment instead (validated
+the same way), a fallback in case Claude Code does not honour the managed
+`pluginConfigs` entry. `forgebench_cli_path` must be a bare command name (looked up
+on `PATH` and `~/.local/bin`) or an absolute path; a relative path with a separator
+is refused.
 
 ### Turn sync off
 
-The `sync` option (default on) controls session sync. Off, the hooks still fire
-but the launcher exits before it reads the transcript, starts the CLI or
-uploads. The MCP server is unaffected; to stop using it, disable the plugin or
-the `forgebench` connector.
+The `sync` option (default on) controls session sync. It is ON for `true`, `1`,
+`yes`, `y`, `on`, `t` or `enabled` (case-insensitive, whitespace and one layer of
+quotes ignored). Empty or unsubstituted means "not set" and takes the manifest
+default (on). Anything else, whether an explicit `false`, `0`, `no`, `n`, `off`, `f`,
+`disabled` or an unrecognised value, is off: sync uploads coding sessions, so
+ambiguity stays off. Off, the hooks still fire but the launcher exits before it
+reads the transcript, starts the CLI or uploads. The MCP server is unaffected; to
+stop using it, disable the plugin or the `forgebench` connector.
 
 ```bash
 echo '{"sync": "false"}' | claude plugin configure forgebench@forgebench --values-stdin

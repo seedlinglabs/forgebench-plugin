@@ -160,7 +160,7 @@ def _run_launcher(
         [sys.executable, str(LAUNCHER), sync, cli, *forwarded],
         input=payload,
         capture_output=True,
-        env={**os.environ, "FAKE_CLI_SECONDS": str(seconds), **(env or {})},
+        env={**_clean_env(), "FAKE_CLI_SECONDS": str(seconds), **(env or {})},
         timeout=30,
     )
     return result, time.monotonic() - started
@@ -422,10 +422,18 @@ def test_production_default_stays_production_without_the_env(fake_cli, tmp_path)
     assert (tmp_path / "argv").read_text().strip() == f"sync --quiet --url {PROD_URL}"
 
 
-def _run_hook(extra_env: dict, args=("sync", "--quiet")):
+def _clean_env() -> dict:
+    """The inherited env minus every variable the launcher reads."""
+    return {
+        k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE_PLUGIN_OPTION_", "FORGEBENCH_"))
+    }
+
+
+def _run_hook(extra_env: dict, args=("sync", "--quiet"), cwd=None):
     return subprocess.run(
         [sys.executable, str(LAUNCHER), *args], input=b"{}", capture_output=True, timeout=30,
-        env={**{k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_PLUGIN_OPTION_")}, **extra_env},
+        env={**_clean_env(), **extra_env},
+        cwd=cwd,
     )
 
 
@@ -472,6 +480,118 @@ def test_legacy_positional_empty_and_dropped_shapes_do_not_misfire(fake_cli, tmp
     # (legacy form only) never start anything unexpected and never fail the hook.
     result, _ = _run_launcher(fake_cli.as_posix(), args=args, sync=args[0] if args[0] != "sync" else "")
     assert result.returncode == 0 and result.stdout == b"" and result.stderr == b""
+
+
+@pytest.mark.parametrize("value", ["true", "TRUE", "1", "yes", "Y", "on", "t", "enabled", '"true"', "'Yes'", ' "on" ', "  t  "])
+def test_sync_on_words_case_and_quotes(value):
+    assert _load_launcher().sync_enabled(value)
+
+
+@pytest.mark.parametrize("value", ["false", "0", "no", "N", "off", "f", "disabled", '"false"', "'off'", "maybe", "2", "truee", '"maybe"'])
+def test_sync_off_and_unrecognised_words_are_off(value):
+    assert not _load_launcher().sync_enabled(value)
+
+
+@pytest.mark.parametrize("value", ["", "   ", "${user_config.sync}", '""', "''"])
+def test_sync_unset_takes_the_manifest_default(value):
+    assert _load_launcher().sync_enabled(value)
+
+
+def test_option_strips_one_layer_of_quotes_for_url_and_cli():
+    m = _load_launcher()
+    env = {"CLAUDE_PLUGIN_OPTION_FORGEBENCH_URL": '"https://own.test/"', "CLAUDE_PLUGIN_OPTION_FORGEBENCH_CLI_PATH": "'/opt/fb'"}
+    assert m.option("forgebench_url", env) == "https://own.test/"
+    assert m.sync_url(m.option("forgebench_url", env)) == "https://own.test"
+    assert m.option("forgebench_cli_path", env) == "/opt/fb"
+    assert m.unquote('""x""') == '"x"'
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["https://x@evil.com", "https://user:pw@evil.com", "https://a b.test", "https://x.test/ y", "http://evil.test", "http://x@127.0.0.1", "https://x.test:99999", "ftp://x.test"],
+)
+def test_sync_url_rejects_userinfo_whitespace_and_non_https(url):
+    assert _load_launcher().sync_url(url) is None
+
+
+def test_sync_url_validates_the_managed_env_fallback_too():
+    m = _load_launcher()
+    assert m.sync_url(PROD_URL, "https://x@evil.com/mcp") is None
+    assert m.sync_url(PROD_URL, "http://evil.test/mcp") is None
+    assert m.sync_url(PROD_URL, "https://ok.test/mcp") == "https://ok.test"
+
+
+def test_with_url_rejects_userinfo_in_every_spelling():
+    m = _load_launcher()
+    assert m.with_url(["sync", "--url", "https://x@evil.com"]) is None
+    assert m.with_url(["sync", "--url=https://x@evil.com"]) is None
+
+
+@posix_only
+def test_hook_form_rejects_userinfo_env_url(fake_cli, tmp_path):
+    _run_hook({"CLAUDE_PLUGIN_OPTION_FORGEBENCH_URL": "https://x@evil.com", "CLAUDE_PLUGIN_OPTION_FORGEBENCH_CLI_PATH": str(fake_cli)})
+    time.sleep(0.5)
+    assert not (tmp_path / "started").exists()
+
+
+@posix_only
+def test_hook_form_rejects_userinfo_in_managed_env_fallback(fake_cli, tmp_path):
+    _run_hook({"FORGEBENCH_MCP_URL": "https://x@evil.com/mcp", "CLAUDE_PLUGIN_OPTION_FORGEBENCH_CLI_PATH": str(fake_cli)})
+    time.sleep(0.5)
+    assert not (tmp_path / "started").exists()
+
+
+def test_resolve_accepts_bare_names_and_absolute_paths_only(tmp_path):
+    m = _load_launcher()
+    exe = tmp_path / "fb"
+    exe.write_text("#!/bin/sh\n")
+    exe.chmod(0o755)
+    assert m.resolve(str(exe)) == str(exe)
+    for relative in ("sub/fb", "./fb", "../fb", "bin/forgebench"):
+        assert m.resolve(relative) is None, relative
+
+
+@posix_only
+def test_relative_cli_path_is_never_run_from_the_hooks_cwd(tmp_path):
+    (tmp_path / "rel").mkdir()
+    marker = tmp_path / "ran"
+    script = tmp_path / "rel" / "fb"
+    script.write_text(f"#!/bin/sh\ntouch {marker}\n")
+    script.chmod(0o755)
+    _run_hook({"CLAUDE_PLUGIN_OPTION_FORGEBENCH_CLI_PATH": "rel/fb"}, cwd=tmp_path)
+    time.sleep(0.5)
+    assert not marker.exists()
+
+
+@posix_only
+def test_empty_argv_behaves_as_the_hook_form(fake_cli, tmp_path):
+    r = _run_hook({"CLAUDE_PLUGIN_OPTION_FORGEBENCH_CLI_PATH": str(fake_cli)}, args=())
+    assert r.returncode == 0 and r.stdout == b"" and r.stderr == b""
+    assert _wait_for(tmp_path / "started", 5)
+    assert (tmp_path / "argv").read_text().strip() == f"sync --quiet --url {PROD_URL}"
+
+
+def _dev_edition(tmp_path: Path, manifest: str | None) -> Path:
+    plugin = tmp_path / "edition"
+    (plugin / ".claude-plugin").mkdir(parents=True)
+    (plugin / "scripts").mkdir()
+    (plugin / "scripts/forgebench_sync_launcher.py").write_text(LAUNCHER.read_text())
+    if manifest is not None:
+        (plugin / ".claude-plugin/plugin.json").write_text(manifest)
+    return plugin / "scripts/forgebench_sync_launcher.py"
+
+
+@posix_only
+@pytest.mark.parametrize("manifest", [None, "{not json", "{}", '{"userConfig": {"forgebench_url": {"default": ""}}}'])
+def test_missing_or_corrupt_manifest_skips_sync_never_prod(fake_cli, tmp_path, manifest):
+    launcher = _dev_edition(tmp_path, manifest)
+    r = subprocess.run(
+        [sys.executable, str(launcher), "sync", "--quiet"], input=b"{}", capture_output=True, timeout=30,
+        env={**_clean_env(), "CLAUDE_PLUGIN_OPTION_FORGEBENCH_CLI_PATH": str(fake_cli)},
+    )
+    assert r.returncode == 0 and r.stdout == b"" and r.stderr == b""
+    time.sleep(0.5)
+    assert not (tmp_path / "started").exists()
 
 
 def test_missing_fork_is_not_a_traceback_end_to_end(tmp_path):

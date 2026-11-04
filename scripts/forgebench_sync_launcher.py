@@ -11,10 +11,14 @@ or unsubstituted (the Claude desktop app skips ``userConfig`` defaults) the stag
 manifest's default is used. The older positional form
 ``<sync> <forgebench-cli> sync --quiet --url <url>`` still works.
 
-``<sync>`` is the plugin's ``sync`` option. Unless it reads as on, the launcher
-exits before reading the hook payload or starting anything, so a user who
-turned sync off uploads nothing; an unrecognised value counts as off; an empty or
-unsubstituted one means "not set" and takes the manifest default (on).
+Option values lose whitespace and one layer of surrounding quotes. ``sync`` is ON for
+true/1/yes/y/on/t/enabled (case-insensitive); empty or unsubstituted means "not set" and takes
+the manifest default (on); anything else (false/0/no/n/off/f/disabled or any unrecognised
+value) is off, since sync uploads coding sessions. A missing or corrupt manifest skips sync
+silently: there is no built-in URL fallback, so a broken dev edition never syncs to production.
+URLs must be https (http only for loopback) with no userinfo or whitespace. The CLI path is a
+bare command name (PATH, ~/.local/bin) or an absolute path; relative paths with a separator are
+refused. Empty argv behaves as ``sync --quiet``.
 
 Why a launcher: a plugin's SessionEnd hook has a fixed ~1.5 s budget, and when
 Claude Code cancels a hook it SIGTERMs the hook's whole process tree.
@@ -46,7 +50,8 @@ from urllib.parse import urlsplit
 PAYLOAD_LIMIT = 1 << 20
 PAYLOAD_WAIT = 2.0  # seconds to wait for a hook payload nobody finishes writing
 CLI_TIMEOUT = 300.0
-SYNC_ON = frozenset({"true", "1", "yes", "on"})
+SYNC_ON = frozenset({"true", "1", "yes", "y", "on", "t", "enabled"})
+SYNC_OFF = frozenset({"false", "0", "no", "n", "off", "f", "disabled"})  # documentation: anything not ON is off
 PRODUCTION_URL = "https://api.forgebench.ai"
 MCP_URL_ENV = "FORGEBENCH_MCP_URL"
 MCP_SUFFIX = "/mcp"
@@ -54,32 +59,39 @@ LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 MANIFEST = Path(__file__).resolve().parent.parent / ".claude-plugin" / "plugin.json"
 
 
-FALLBACKS = {"forgebench_url": PRODUCTION_URL, "forgebench_cli_path": "forgebench", "sync": "true"}
+def manifest_default(key: str) -> str | None:
+    """The staged manifest's default for option ``key`` (the edition's own).
 
-
-def manifest_default(key: str) -> str:
-    """The staged manifest's default for option ``key`` (the edition's own), else a built-in."""
+    None when the manifest is missing or corrupt: there is deliberately no built-in fallback,
+    so a broken dev or staging edition can never sync to production.
+    """
     try:
         value = json.loads(MANIFEST.read_text())["userConfig"][key]["default"]
-        return str(value).lower() if isinstance(value, bool) else str(value)
     except (OSError, ValueError, KeyError, TypeError):
-        return FALLBACKS[key]
+        return None
+    if isinstance(value, bool):
+        return str(value).lower()
+    return value if isinstance(value, str) and value.strip() else None
 
 
-def manifest_url() -> str:
-    return manifest_default("forgebench_url")
+def unquote(value: str) -> str:
+    """``value`` stripped of whitespace and one layer of matching surrounding quotes."""
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1].strip()
+    return value
 
 
 def is_unset(value: str) -> bool:
     """Empty or an unsubstituted ``${...}``: the desktop app skipped the default."""
-    value = value.strip()
+    value = unquote(value)
     return not value or value.startswith("${")
 
 
-def option(key: str, env: dict | None = None) -> str:
-    """Option ``key`` from ``CLAUDE_PLUGIN_OPTION_<KEY>``, else the manifest default."""
+def option(key: str, env: dict | None = None) -> str | None:
+    """Option ``key`` from ``CLAUDE_PLUGIN_OPTION_<KEY>``, else the manifest default (None if unreadable)."""
     value = (os.environ if env is None else env).get(f"CLAUDE_PLUGIN_OPTION_{key.upper()}", "")
-    return manifest_default(key) if is_unset(value) else value.strip()
+    return manifest_default(key) if is_unset(value) else unquote(value)
 
 
 def read_payload() -> bytes:
@@ -105,9 +117,13 @@ def read_payload() -> bytes:
 
 
 def resolve(cli: str) -> str | None:
-    """``cli`` as an executable path; a bare name is looked up on PATH and ~/.local/bin."""
-    if os.sep in cli:
-        return cli if os.access(cli, os.X_OK) else None
+    """``cli`` as an executable path.
+
+    A bare name is looked up on PATH and ~/.local/bin; an absolute path is used as is; a
+    relative path with a separator is refused (never resolved against the hook's cwd).
+    """
+    if os.sep in cli or "/" in cli:
+        return cli if os.path.isabs(cli) and os.access(cli, os.X_OK) else None
     local_bin = os.path.join(os.path.expanduser("~"), ".local", "bin")
     return shutil.which(cli) or shutil.which(cli, path=local_bin)
 
@@ -126,9 +142,15 @@ def detach() -> bool:
 
 
 def sync_enabled(value: str) -> bool:
-    if is_unset(value):  # not set by the user: the manifest default (true)
-        value = manifest_default("sync")
-    return value.strip().lower() in SYNC_ON
+    """ON for true/1/yes/y/on/t/enabled (case-insensitive, quotes stripped).
+
+    Empty or unsubstituted means "not set": the manifest default (true). Anything else,
+    including the explicit off words and every unrecognised value, is off: sync uploads
+    coding sessions, so ambiguity stays off.
+    """
+    if is_unset(value):
+        value = manifest_default("sync") or ""
+    return unquote(value).lower() in SYNC_ON
 
 
 def sync_url(value: str, env_mcp_url: str = "") -> str | None:
@@ -142,16 +164,21 @@ def sync_url(value: str, env_mcp_url: str = "") -> str | None:
     deployment, that deployment wins: the fallback for a Claude Code that does not
     honour the managed ``pluginConfigs`` entry.
     """
-    url = value.strip().rstrip("/")
+    url = unquote(value).rstrip("/")
     if is_unset(url):  # desktop app: option empty or unsubstituted
-        url = manifest_url().rstrip("/")
-    env_url = env_mcp_url.strip().rstrip("/")
+        url = (manifest_default("forgebench_url") or "").rstrip("/")
+    env_url = unquote(env_mcp_url).rstrip("/")
     if url == PRODUCTION_URL and env_url:
         url = env_url.removesuffix(MCP_SUFFIX).rstrip("/")
+    if not url or any(c.isspace() for c in url):
+        return None
     try:
         parts = urlsplit(url)
         host = parts.hostname or ""
+        parts.port  # noqa: B018 - raises ValueError on a bad port
     except ValueError:
+        return None
+    if "@" in parts.netloc:  # userinfo: https://x@evil.com
         return None
     if parts.scheme == "https" and host:
         return url
@@ -211,17 +238,25 @@ def can_detach() -> bool:
 
 
 def main(argv: list[str]) -> int:
-    if not argv or not can_detach():
+    if not can_detach():
         return 0
+    if not argv:  # host ignored the exec-form args: behave as the hook form
+        argv = ["sync", "--quiet"]
     if argv[0] == "sync":
         # Hook form: options come from CLAUDE_PLUGIN_OPTION_* env vars, so a dropped empty
         # argument cannot shift anything. Defaults come from the staged manifest.
-        sync, cli, rest = option("sync"), option("forgebench_cli_path"), [*argv, "--url", option("forgebench_url")]
+        sync, cli, url = option("sync"), option("forgebench_cli_path"), option("forgebench_url")
+        if None in (sync, cli, url):
+            return 0  # manifest missing or corrupt: never guess (a broken dev edition must not hit prod)
+        rest = [*argv, "--url", url]
     elif len(argv) >= 2:
         sync, cli, *rest = argv  # legacy positional form: <sync> <cli> sync ...
     else:
         return 0
     if not sync_enabled(sync):
+        return 0
+    cli = option("forgebench_cli_path", {"CLAUDE_PLUGIN_OPTION_FORGEBENCH_CLI_PATH": cli})
+    if cli is None:
         return 0
     checked = with_url(rest, os.environ.get(MCP_URL_ENV, ""))
     if checked is None:
@@ -233,7 +268,7 @@ def main(argv: list[str]) -> int:
         return 0  # could not fork: drop this sync rather than fail the hook
     try:
         payload = read_payload()
-        executable = resolve(cli or "forgebench")
+        executable = resolve(cli)
         if executable is not None:
             subprocess.run(
                 [executable, *rest],
