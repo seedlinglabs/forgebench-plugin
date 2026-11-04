@@ -3,12 +3,18 @@
 
 Usage (what ``hooks/hooks.json`` runs, exec form, no shell)::
 
-    forgebench_sync_launcher.py <sync> <forgebench-cli> sync --quiet --url <url>
+    forgebench_sync_launcher.py sync --quiet
+
+The ``sync``, ``forgebench_cli_path`` and ``forgebench_url`` options are read from the
+``CLAUDE_PLUGIN_OPTION_<KEY>`` environment Claude Code exports to hooks; when one is empty
+or unsubstituted (the Claude desktop app skips ``userConfig`` defaults) the staged
+manifest's default is used. The older positional form
+``<sync> <forgebench-cli> sync --quiet --url <url>`` still works.
 
 ``<sync>`` is the plugin's ``sync`` option. Unless it reads as on, the launcher
 exits before reading the hook payload or starting anything, so a user who
-turned sync off uploads nothing; an unrecognised value (an unsubstituted
-``${user_config.sync}``, say) counts as off.
+turned sync off uploads nothing; an unrecognised value counts as off; an empty or
+unsubstituted one means "not set" and takes the manifest default (on).
 
 Why a launcher: a plugin's SessionEnd hook has a fixed ~1.5 s budget, and when
 Claude Code cancels a hook it SIGTERMs the hook's whole process tree.
@@ -48,12 +54,32 @@ LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 MANIFEST = Path(__file__).resolve().parent.parent / ".claude-plugin" / "plugin.json"
 
 
-def manifest_url() -> str:
-    """The staged manifest's forgebench_url default (the edition's URL), or production."""
+FALLBACKS = {"forgebench_url": PRODUCTION_URL, "forgebench_cli_path": "forgebench", "sync": "true"}
+
+
+def manifest_default(key: str) -> str:
+    """The staged manifest's default for option ``key`` (the edition's own), else a built-in."""
     try:
-        return json.loads(MANIFEST.read_text())["userConfig"]["forgebench_url"]["default"]
+        value = json.loads(MANIFEST.read_text())["userConfig"][key]["default"]
+        return str(value).lower() if isinstance(value, bool) else str(value)
     except (OSError, ValueError, KeyError, TypeError):
-        return PRODUCTION_URL
+        return FALLBACKS[key]
+
+
+def manifest_url() -> str:
+    return manifest_default("forgebench_url")
+
+
+def is_unset(value: str) -> bool:
+    """Empty or an unsubstituted ``${...}``: the desktop app skipped the default."""
+    value = value.strip()
+    return not value or value.startswith("${")
+
+
+def option(key: str, env: dict | None = None) -> str:
+    """Option ``key`` from ``CLAUDE_PLUGIN_OPTION_<KEY>``, else the manifest default."""
+    value = (os.environ if env is None else env).get(f"CLAUDE_PLUGIN_OPTION_{key.upper()}", "")
+    return manifest_default(key) if is_unset(value) else value.strip()
 
 
 def read_payload() -> bytes:
@@ -100,6 +126,8 @@ def detach() -> bool:
 
 
 def sync_enabled(value: str) -> bool:
+    if is_unset(value):  # not set by the user: the manifest default (true)
+        value = manifest_default("sync")
     return value.strip().lower() in SYNC_ON
 
 
@@ -115,7 +143,7 @@ def sync_url(value: str, env_mcp_url: str = "") -> str | None:
     honour the managed ``pluginConfigs`` entry.
     """
     url = value.strip().rstrip("/")
-    if not url or url.startswith("${"):  # desktop app: option empty or unsubstituted
+    if is_unset(url):  # desktop app: option empty or unsubstituted
         url = manifest_url().rstrip("/")
     env_url = env_mcp_url.strip().rstrip("/")
     if url == PRODUCTION_URL and env_url:
@@ -183,9 +211,18 @@ def can_detach() -> bool:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) < 2 or not sync_enabled(argv[0]) or not can_detach():
+    if not argv or not can_detach():
         return 0
-    cli, *rest = argv[1:]
+    if argv[0] == "sync":
+        # Hook form: options come from CLAUDE_PLUGIN_OPTION_* env vars, so a dropped empty
+        # argument cannot shift anything. Defaults come from the staged manifest.
+        sync, cli, rest = option("sync"), option("forgebench_cli_path"), [*argv, "--url", option("forgebench_url")]
+    elif len(argv) >= 2:
+        sync, cli, *rest = argv  # legacy positional form: <sync> <cli> sync ...
+    else:
+        return 0
+    if not sync_enabled(sync):
+        return 0
     checked = with_url(rest, os.environ.get(MCP_URL_ENV, ""))
     if checked is None:
         return 0  # an unusable or insecure upload URL: send nothing
