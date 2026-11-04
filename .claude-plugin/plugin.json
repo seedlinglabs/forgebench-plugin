@@ -43,8 +43,9 @@
     "mcp_url": {
       "type": "string",
       "title": "Forgebench MCP URL",
-      "description": "The hosted MCP server URL, usually the Forgebench URL plus /mcp. Leave unset to skip the MCP server; sync is unaffected.",
-      "required": false
+      "description": "The hosted MCP server URL, usually the Forgebench URL plus /mcp.",
+      "required": false,
+      "default": "https://api.forgebench.ai/mcp"
     }
   }
 }
