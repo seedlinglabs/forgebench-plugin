@@ -57,12 +57,10 @@ def require_production_url(plugin_dir: Path) -> None:
     if mcp_default != f"{PRODUCTION_URL}/mcp":
         raise ValueError(f"plugin MCP must default to {PRODUCTION_URL}/mcp (got {mcp_default!r})")
 
-    valid_mcp_urls = ("${user_config.mcp_url}", f"{PRODUCTION_URL}/mcp", "${user_config.forgebench_url}/mcp")
-    resolved = configured_url.replace("${user_config.forgebench_url}", default)
-    if configured_url not in valid_mcp_urls and resolved != f"{PRODUCTION_URL}/mcp":
+    # The desktop app does not apply userConfig defaults, so the URL must be a literal.
+    if configured_url != f"{PRODUCTION_URL}/mcp":
         raise ValueError(
-            "plugin must resolve its MCP URL to https://api.forgebench.ai/mcp "
-            f"or use '${{user_config.mcp_url}}' (got {configured_url!r})"
+            f"plugin .mcp.json must hard-code {PRODUCTION_URL}/mcp (got {configured_url!r})"
         )
 
 
@@ -74,6 +72,10 @@ def apply_edition(plugin_dir: Path, edition: str, build: str) -> None:
     manifest["userConfig"]["forgebench_url"]["default"] = EDITION_URLS[edition]
     manifest["userConfig"]["mcp_url"]["default"] = f"{EDITION_URLS[edition]}/mcp"
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    mcp_path = plugin_dir / ".mcp.json"
+    mcp = json.loads(mcp_path.read_text())
+    mcp["mcpServers"]["forgebench"]["url"] = f"{EDITION_URLS[edition]}/mcp"
+    mcp_path.write_text(json.dumps(mcp, indent=2) + "\n")
 
 
 def stage(source: Path, destination: Path, edition: str = "prod", build: str = "") -> None:
