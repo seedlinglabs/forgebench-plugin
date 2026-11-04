@@ -74,6 +74,25 @@ def test_production_url_guard_rejects_wrong_mcp_default(tmp_path):
     assert "MCP must default to https://api.forgebench.ai/mcp" in result.stderr
 
 
+def test_prod_staging_keeps_the_production_mcp_url(tmp_path):
+    staged, result = _stage(tmp_path)
+    assert result.returncode == 0, result.stderr
+    mcp = json.loads((staged / "plugins/forgebench/.mcp.json").read_text())
+    assert mcp["mcpServers"]["forgebench"]["url"] == "https://api.forgebench.ai/mcp"
+
+
+def test_production_url_guard_rejects_templated_or_non_prod_mcp_url(tmp_path):
+    for i, bad in enumerate(("${user_config.mcp_url}", "https://api.dev.forgebench.ai/mcp")):
+        plugin = tmp_path / f"plugin{i}"
+        shutil.copytree(PLUGIN_DIR, plugin)
+        (plugin / ".mcp.json").write_text(json.dumps({"mcpServers": {"forgebench": {"type": "http", "url": bad}}}))
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "--source", str(plugin), "--destination", str(tmp_path / f"staged{i}")],
+            capture_output=True, text=True,
+        )
+        assert result.returncode != 0 and "must hard-code" in result.stderr
+
+
 def _stage(tmp_path, *extra):
     staged = tmp_path / "staged"
     result = subprocess.run(
@@ -91,9 +110,12 @@ def test_dev_and_staging_editions_point_at_their_environment(tmp_path):
         manifest = json.loads((staged / "plugins/forgebench/.claude-plugin/plugin.json").read_text())
         assert manifest["userConfig"]["forgebench_url"]["default"] == url
         assert manifest["userConfig"]["mcp_url"]["default"] == f"{url}/mcp"
+        mcp = json.loads((staged / "plugins/forgebench/.mcp.json").read_text())
+        assert mcp["mcpServers"]["forgebench"]["url"] == f"{url}/mcp"
         assert manifest["version"].endswith(f"-{edition}.7")
         marketplace = json.loads((staged / ".claude-plugin/marketplace.json").read_text())
         assert marketplace["name"] == f"forgebench-{edition}"
+    assert json.loads((PLUGIN_DIR / ".mcp.json").read_text())["mcpServers"]["forgebench"]["url"] == "https://api.forgebench.ai/mcp"
     source = json.loads((PLUGIN_DIR / ".claude-plugin/plugin.json").read_text())
     assert source["userConfig"]["forgebench_url"]["default"] == "https://api.forgebench.ai"
 
