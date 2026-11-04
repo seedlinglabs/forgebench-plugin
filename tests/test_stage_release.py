@@ -82,12 +82,12 @@ def test_prod_staging_keeps_the_production_mcp_url(tmp_path):
 
 
 def test_production_url_guard_rejects_templated_or_non_prod_mcp_url(tmp_path):
-    for bad in ("${user_config.mcp_url}", "https://api.dev.forgebench.ai/mcp"):
-        plugin = tmp_path / f"p{abs(hash(bad))}"
+    for i, bad in enumerate(("${user_config.mcp_url}", "https://api.dev.forgebench.ai/mcp")):
+        plugin = tmp_path / f"plugin{i}"
         shutil.copytree(PLUGIN_DIR, plugin)
         (plugin / ".mcp.json").write_text(json.dumps({"mcpServers": {"forgebench": {"type": "http", "url": bad}}}))
         result = subprocess.run(
-            [sys.executable, str(SCRIPT), "--source", str(plugin), "--destination", str(tmp_path / f"s{abs(hash(bad))}")],
+            [sys.executable, str(SCRIPT), "--source", str(plugin), "--destination", str(tmp_path / f"staged{i}")],
             capture_output=True, text=True,
         )
         assert result.returncode != 0 and "must hard-code" in result.stderr
