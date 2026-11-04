@@ -72,14 +72,9 @@ def test_hooks_are_exec_form_and_call_the_launcher():
         assert hook["type"] == "command", event
         assert hook["command"] == "${CLAUDE_PLUGIN_ROOT}/scripts/forgebench_sync_launcher.py", event
         # Exec form: arguments are a list, not a shell string.
-        assert hook["args"] == [
-            "${user_config.sync}",
-            "${user_config.forgebench_cli_path}",
-            "sync",
-            "--quiet",
-            "--url",
-            "${user_config.forgebench_url}",
-        ], event
+        # No ${user_config.*} args: options arrive as CLAUDE_PLUGIN_OPTION_* env vars, so a host
+        # that drops empty arguments cannot shift anything.
+        assert hook["args"] == ["sync", "--quiet"], event
         assert set(hook) == {"type", "command", "args"}, event
     assert LAUNCHER.is_file() and os.access(LAUNCHER, os.X_OK), "the hook command must be executable"
     assert LAUNCHER.read_text(encoding="utf-8").startswith("#!/usr/bin/env python3\n")
@@ -100,12 +95,12 @@ def test_user_config_declares_url_cli_path_sync_and_mcp_url():
     # Hooks live in hooks/hooks.json and the server in .mcp.json, found at their default paths.
     for field in ("hooks", "mcpServers"):
         assert field not in plugin, field
-    # Every ${user_config.KEY} the plugin uses is declared; mcp_url is kept but no longer referenced.
+    # Any ${user_config.KEY} the plugin uses must be declared (currently none: hooks read env, MCP is literal).
     used = set()
     for rel in ("hooks/hooks.json", ".mcp.json"):
         text = (PLUGIN / rel).read_text(encoding="utf-8")
         used |= {part.split("}")[0] for part in text.split("${user_config.")[1:]}
-    assert used == set(config) - {"mcp_url"}
+    assert used <= set(config) and not used  # options reach hooks via CLAUDE_PLUGIN_OPTION_* env, not args
 
 
 def test_mcp_json_url_is_the_literal_production_url():
@@ -254,7 +249,7 @@ def test_launcher_never_fails_the_hook(tmp_path):
 
 
 @posix_only
-@pytest.mark.parametrize("sync", ["false", "False", "0", "", "${user_config.sync}", "maybe"])
+@pytest.mark.parametrize("sync", ["false", "False", "0", "off", "maybe"])
 def test_sync_off_never_starts_the_cli(fake_cli, tmp_path, sync):
     """Off, empty or unrecognised (fail closed: no upload without a clear yes)."""
     result, elapsed = _run_launcher(str(fake_cli), sync=sync, payload=b'{"session_id": "abc"}')
@@ -264,7 +259,7 @@ def test_sync_off_never_starts_the_cli(fake_cli, tmp_path, sync):
     assert not (tmp_path / "argv").exists() and not (tmp_path / "started").exists()
 
 
-@pytest.mark.parametrize("sync", ["true", "True", "1"])
+@pytest.mark.parametrize("sync", ["true", "True", "1", "", "${user_config.sync}"])
 def test_sync_on_values(sync):
     assert _load_launcher().sync_enabled(sync)
 
@@ -425,6 +420,58 @@ def test_production_default_stays_production_without_the_env(fake_cli, tmp_path)
     _run_launcher(fake_cli.as_posix(), url=PROD_URL + "/", env={"FORGEBENCH_MCP_URL": ""})
     assert _wait_for(tmp_path / "started", 5)
     assert (tmp_path / "argv").read_text().strip() == f"sync --quiet --url {PROD_URL}"
+
+
+def _run_hook(extra_env: dict, args=("sync", "--quiet")):
+    return subprocess.run(
+        [sys.executable, str(LAUNCHER), *args], input=b"{}", capture_output=True, timeout=30,
+        env={**{k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_PLUGIN_OPTION_")}, **extra_env},
+    )
+
+
+@posix_only
+@pytest.mark.parametrize("env", [{}, {"CLAUDE_PLUGIN_OPTION_SYNC": ""}, {"CLAUDE_PLUGIN_OPTION_SYNC": "${user_config.sync}"}])
+def test_hook_form_empty_or_absent_options_use_manifest_defaults(fake_cli, tmp_path, env):
+    # sync empty -> on (manifest default true); cli empty -> falls back to the manifest "forgebench" name on PATH.
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    (shim / "forgebench").symlink_to(fake_cli)
+    r = _run_hook({**env, "PATH": f"{shim}:{os.environ['PATH']}", "CLAUDE_PLUGIN_OPTION_FORGEBENCH_URL": ""})
+    assert r.returncode == 0 and r.stdout == b"" and r.stderr == b""
+    assert _wait_for(tmp_path / "started", 5)
+    assert (tmp_path / "argv").read_text().strip() == f"sync --quiet --url {PROD_URL}"
+
+
+@posix_only
+def test_hook_form_env_options_are_used(fake_cli, tmp_path):
+    r = _run_hook({
+        "CLAUDE_PLUGIN_OPTION_SYNC": "true",
+        "CLAUDE_PLUGIN_OPTION_FORGEBENCH_CLI_PATH": str(fake_cli),
+        "CLAUDE_PLUGIN_OPTION_FORGEBENCH_URL": "https://own.test/",
+    })
+    assert r.returncode == 0
+    assert _wait_for(tmp_path / "started", 5)
+    assert (tmp_path / "argv").read_text().strip() == "sync --quiet --url https://own.test"
+
+
+@posix_only
+@pytest.mark.parametrize("off", ["false", "0", "off"])
+def test_hook_form_explicit_off_never_starts_the_cli(fake_cli, tmp_path, off):
+    _run_hook({"CLAUDE_PLUGIN_OPTION_SYNC": off, "CLAUDE_PLUGIN_OPTION_FORGEBENCH_CLI_PATH": str(fake_cli)})
+    time.sleep(0.5)
+    assert not (tmp_path / "started").exists()
+
+
+@posix_only
+@pytest.mark.parametrize(
+    "args",
+    [["", "", "sync", "--quiet", "--url", ""], ["", "sync", "--quiet", "--url"], ["sync", "--quiet", "--url"]],
+)
+def test_legacy_positional_empty_and_dropped_shapes_do_not_misfire(fake_cli, tmp_path, args):
+    # Empty sync/url positionals mean "unset": defaults apply. Shapes that lose the cli arg
+    # (legacy form only) never start anything unexpected and never fail the hook.
+    result, _ = _run_launcher(fake_cli.as_posix(), args=args, sync=args[0] if args[0] != "sync" else "")
+    assert result.returncode == 0 and result.stdout == b"" and result.stderr == b""
 
 
 def test_missing_fork_is_not_a_traceback_end_to_end(tmp_path):
