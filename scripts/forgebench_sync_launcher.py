@@ -27,12 +27,14 @@ detach (creationflags) is follow-up #1146 (#1060). Python 3.10+, stdlib only.
 
 from __future__ import annotations
 
+import json
 import os
 import select
 import shutil
 import subprocess
 import sys
 import time
+from pathlib import Path
 from urllib.parse import urlsplit
 
 PAYLOAD_LIMIT = 1 << 20
@@ -43,6 +45,15 @@ PRODUCTION_URL = "https://api.forgebench.ai"
 MCP_URL_ENV = "FORGEBENCH_MCP_URL"
 MCP_SUFFIX = "/mcp"
 LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+MANIFEST = Path(__file__).resolve().parent.parent / ".claude-plugin" / "plugin.json"
+
+
+def manifest_url() -> str:
+    """The staged manifest's forgebench_url default (the edition's URL), or production."""
+    try:
+        return json.loads(MANIFEST.read_text())["userConfig"]["forgebench_url"]["default"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return PRODUCTION_URL
 
 
 def read_payload() -> bytes:
@@ -95,7 +106,8 @@ def sync_enabled(value: str) -> bool:
 def sync_url(value: str, env_mcp_url: str = "") -> str | None:
     """The base URL to upload to, or None to refuse (nothing is uploaded).
 
-    A trailing slash is stripped (no ``//mcp``-style joins downstream). Session
+    An empty (or unsubstituted) value, as the Claude desktop app passes when it
+    skips userConfig defaults, falls back to the manifest default. A trailing slash is stripped (no ``//mcp``-style joins downstream). Session
     content is only sent over https; plain http is accepted for loopback hosts
     (the local stack) and refused for anything else. When the option is still the
     production default and the managed settings' ``FORGEBENCH_MCP_URL`` names a
@@ -103,6 +115,8 @@ def sync_url(value: str, env_mcp_url: str = "") -> str | None:
     honour the managed ``pluginConfigs`` entry.
     """
     url = value.strip().rstrip("/")
+    if not url or url.startswith("${"):  # desktop app: option empty or unsubstituted
+        url = manifest_url().rstrip("/")
     env_url = env_mcp_url.strip().rstrip("/")
     if url == PRODUCTION_URL and env_url:
         url = env_url.removesuffix(MCP_SUFFIX).rstrip("/")
@@ -149,9 +163,8 @@ def with_url(args: list[str], env_mcp_url: str = "") -> list[str] | None:
             continue
         name, value = flag
         if value is None:
-            if index + 1 >= len(args):
-                return None
-            url = sync_url(args[index + 1], env_mcp_url)
+            # A trailing bare --url (empty value dropped by the host) takes the manifest default.
+            url = sync_url(args[index + 1] if index + 1 < len(args) else "", env_mcp_url)
             if url is None:
                 return None
             checked += [name, url]
