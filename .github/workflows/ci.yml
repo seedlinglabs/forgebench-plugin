@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [develop, 'release/**']
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: python -m pip install pytest
+      - run: python -m pytest tests -q
+      - name: Install Claude Code CLI
+        run: npm install --global @anthropic-ai/claude-code
+      - name: Validate the source marketplace
+        run: claude plugin validate .
+      - name: Stage and validate stable and dev editions
+        run: |
+          set -euo pipefail
+          STABLE_DIR="$(mktemp -d)"
+          # The default edition is prod (stable).
+          python scripts/stage_release.py --destination "$STABLE_DIR"
+          claude plugin validate "$STABLE_DIR/plugins/forgebench"
+          claude plugin validate "$STABLE_DIR"
+          DEV_DIR="$(mktemp -d)"
+          python scripts/stage_release.py --edition dev --build "$GITHUB_RUN_NUMBER" --destination "$DEV_DIR"
+          claude plugin validate "$DEV_DIR/plugins/forgebench"
+          claude plugin validate "$DEV_DIR"
