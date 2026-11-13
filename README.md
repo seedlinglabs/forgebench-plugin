@@ -70,9 +70,8 @@ server URL is **hard-coded** to `https://api.forgebench.ai/mcp` in `.mcp.json`:
 the Claude desktop app does not apply `userConfig` defaults, so a
 `${user_config.*}` reference there resolved to an empty URL and the connector
 never connected. The `mcp_url` option is therefore ignored (it is kept only so
-existing managed settings that set it stay valid). Dev and staging editions
-published from `develop` and `staging` get their own `/mcp` URL written into the
-staged `.mcp.json` at release time.
+existing managed settings that set it stay valid). The dev edition gets its own
+`/mcp` URL written into the staged `.mcp.json` at release time.
 
 To sync to a custom or on-premises deployment:
 
@@ -176,3 +175,28 @@ claude plugin validate ./packages/forgebench-plugin       # manifest and skill c
 claude plugin uninstall forgebench@forgebench
 claude plugin marketplace remove forgebench
 ```
+
+## Release lifecycle
+
+- `develop` is the trunk. Every change, including hotfixes, lands by PR with a
+  merge commit. Squash and rebase merges break the ancestry forgebench checks.
+- `main` is the production install channel for
+  `claude plugin marketplace add seedlinglabs/forgebench-plugin`. After the admin
+  cutover, only forgebench release automation fast-forwards it to the plugin
+  commit pinned on forgebench `main`. Until that automation is live on forgebench
+  `main`, the manual release path remains available.
+- `staging` is retired as a promotion input. The branch stays in place.
+- If `develop` has unreleasable work, cut `release/*` from the commit currently on
+  `main`. Land the hotfix there by PR with a merge commit, ship it through a
+  forgebench `main` pin bump, then merge the hotfix branch back into `develop`.
+- Increase `.claude-plugin/plugin.json` `version` when shipped plugin files change.
+  Users receive an update only when the version increases. forgebench enforces
+  the bump when shipping.
+- Rollbacks roll forward: revert on `develop` or `release/*`, then ship a pin bump.
+  `main` never moves backwards.
+
+forgebench is the single edition publisher: dev goes to
+`seedlinglabs/forgebench-cli@plugin-dev`, stable to `seedlinglabs/forgebench-cli@main`.
+This repository runs CI only, validating the source marketplace and the staged
+stable and dev editions. Staging edition support in `scripts/stage_release.py`
+remains available to forgebench.
